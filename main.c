@@ -22,6 +22,8 @@
 #include "session.h"
 #include "helper.h"
 
+struct sessions_list* sessions_list;
+
 /*
  * INSERT/REMOVE MODULE - start
  */
@@ -79,6 +81,18 @@ int init_module(void) {
         enable_write_protected_mode(&cr0);
 
         /*
+         * Instantiate a new object to keep track of active sessions
+         */
+
+        sessions_list=kmalloc(sizeof(struct sessions_list),GFP_KERNEL);
+
+        /*
+         * Initialize its
+         */
+
+        init_sessions(sessions_list);
+
+        /*
          * Log message about our just inserted module
          */
 
@@ -120,7 +134,7 @@ void cleanup_module(void) {
          * Remove the data structures associated to the session semantics
          */
 
-        //cleanup_sessions();
+        cleanup_sessions();
 
         printk(KERN_INFO "Module \"session_module\" removed: restored system call table\n");
 
