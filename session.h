@@ -20,21 +20,42 @@ extern struct sessions_list* sessions_list;
  * Structure to handle an I/O session on a file
  *
  * buffer: pointer to the content of the file during a session
+ *
  * pages: pointer to the page descriptor of the first page in the buffer
+ *
  * order: the buffer session is made of 1<<order pages
+ *
  * lock: spinlock to be used to synchronize read and write operations on the
  * file during a session
+ *
  * position: offset with respect to the beginning of the file from which
  * the next I/O operation will take place during a session
+ *
  * filesize: number of bytes in the file
+ *
  * limit: size of the buffer
- * write: pointer to the former write operations for the file opened adopting
- * a session semantics
+ *
+ * f_ops_old: pointer to the structure containing pointers to original file operations
+ * of an opened file; the legacy "write" operations is used to flush content of
+ * the session when this is over and all the legacy operations are restored when
+ * the session is removed
+ *
+ * f_ops_new: pointer to the structure containing pointers to the file operations in
+ * session mode. This pointer is requested in order to properly release allocated
+ * memory when the session is closed
+ *
  * dirty: indicates that the session buffer has been modified, so as the session
  * gets closed the modifications have to be propagated to the original file
- * filename: string representing the filename in the user-space
+ *
  * link_to_list: list_head structure connecting the session object to the list of
  * all session objects
+ *
+ * filename: string representing the filename in the user-space
+ *
+ * file: pointer to the "struct file" associated to the opened file
+ *
+ * private: backup of the field "private_data" of the opened file. During a session,
+ * this field is used to store the session object associated to the opened file
  */
 
 struct session{
@@ -45,10 +66,13 @@ struct session{
         loff_t position;
         loff_t filesize;
         int limit;
-        ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
+        struct file_operations *f_ops_old;
+        struct file_operations *f_ops_new;
         bool dirty;
-        const char __user* filename;
         struct list_head link_to_list;
+        const char __user* filename;
+        struct file *file;
+        void* private;
 };
 
 /*
@@ -59,7 +83,6 @@ struct session{
  */
 
 struct sessions_list{
-        int a;
         struct list_head sessions_head;
 };
 
@@ -83,8 +106,8 @@ struct buffer_page{
 extern asmlinkage long (*previous_open)(const char __user* filename,int flags,int mode);
 extern asmlinkage long sys_session_open(const char __user* filename,int flags,int mode);
 extern asmlinkage long (*truncate_call)(const char * path, long length);
-void cleanup_sessions(void);
-void init_sessions(struct sessions_list* sessions_list);
+void sessions_remove(void);
+void sessions_list_init(struct sessions_list* sessions_list);
 
 /*
  * FUNCTION PROTOTYPES - end

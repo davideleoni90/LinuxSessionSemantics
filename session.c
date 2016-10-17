@@ -24,35 +24,16 @@
 extern asmlinkage long (*truncate_call)(const char *path, long length);
 
 /*
- * GLOBAL VARIABLES - start
- */
-
-/*
- * Pointer to new structure for file operations
- */
-
-struct file_operations *f_ops;
-
-/*
- * Pointer to the descriptor of the first page allocated to read the file
- */
-
-struct page *first_page;
-
-/*
- * GLOBAL VARIABLES - end
- */
-
-/*
  * REMOVE SESSION - start
  *
- * Free the buffer associated to the session and th remove the session
- * object itself
+ * Free the buffer associated to the session, restore the original file
+ * operations in the file opened and free the ession object itself.
+ *
+ * THIS HAS TO BE CALLED HOLDING THE LOCK ON THE SESSSION OBJECT; THE
+ * LOCK IS RELEASED WITHIN THIS FUNCTION
  */
 
-void remove_session(struct session *session) {
-
-        printk(KERN_INFO "removing session %lu\n", session);
+void session_remove(struct session *session) {
 
         /*
          * Index to scan through the page descriptors
@@ -61,67 +42,74 @@ void remove_session(struct session *session) {
         int i = 0;
 
         /*
-         * Acquire lock on the session object
-         */
-
-        //spin_lock(&session->lock);
-
-        /*
          * Set the "mapping" field of the pages of the buffer
          * to NULL, otherwise "free_pages" complains because
          * pages are still in used
          */
 
-        //printk(KERN_INFO "start loop session %lu %d\n", session,session->order);
+        for (i = 0; i < (1 << (session->order)); i++) {
 
-        //for (i = 0; i < (1 << (session->order)); i++) {
+                /*
+                 * Current page descriptor
+                 */
 
-        /*
-         * Current page descriptor
-         */
+                struct page *page;
 
-        //struct page *page;
+                /*
+                 * Get page descriptor of current page
+                 */
 
-        /*
-         * Get page descriptor of current page
-         */
+                page = session->pages + i;
 
-        //if (!page) {
-        //printk(KERN_INFO "NULL PAGE\n");
-        //}
-        //else {
-        //page = session->pages + i;
-        //printk(KERN_INFO "page %lu\n", page);
+                /*
+                 * Set mapping to NULL for the current page
+                 */
 
-        /*
-         * Set mapping to NULL for the current page
-         */
-
-        //page->mapping = NULL;
-
-        //printk(KERN_INFO "page:%d\n", i);
-
-        //}
-        //}
+                page->mapping = NULL;
+        }
 
         /*
          * Release buffer
          */
 
-        //free_pages(session->buffer, session->order);
+        free_pages(session->buffer, session->order);
+
+        /*
+         * Restore original file operations in the opened file
+         */
+
+        session->file->f_op=session->f_ops_old;
+
+        /*
+         * Restore the "private_data" field of the opened file
+         */
+
+        session->file->private_data=session->private;
+
+        /*
+         * Release the structure with session file operations
+         */
+
+        kfree(session->f_ops_new);
+
+
+        /*
+         * Remove the session object from the global list of sessions
+         */
+
+        list_del(&session->link_to_list);
 
         /*
          * Release lock on the session object
          */
 
-        //spin_unlock(&session->lock);
+        spin_unlock(&session->lock);
 
         /*
          * Remove the session object itself
          */
 
-        //printk(KERN_INFO "done with sesssion %lu", session);
-        //kfree(session);
+        kfree(session);
 }
 
 /*
@@ -137,7 +125,7 @@ void remove_session(struct session *session) {
  * @sessions_list: pointer to object to be initialized
  */
 
-void init_sessions(struct sessions_list *sessions) {
+void sessions_list_init(struct sessions_list *sessions) {
 
         INIT_LIST_HEAD(&(sessions->sessions_head));
 }
@@ -916,7 +904,7 @@ int session_close(struct file *file, fl_owner_t id) {
                  */
 
                 printk("params-> buf:%lu filesize:%d off:%d", buffer, filesize, off);
-                ret = session->write(file, buffer, filesize, &off);
+                ret = session->f_ops_old->write(file, buffer, filesize, &off);
 
                 /*
                  * Restore memory segment
@@ -937,13 +925,13 @@ int session_close(struct file *file, fl_owner_t id) {
          * Unlock the session
          */
 
-        spin_unlock(&session->lock);
+        //spin_unlock(&session->lock);
 
         /*
-         * Free the session object
+         * Remove the session object and its associated data structures
          */
 
-        kfree(session);
+        session_remove(session);
 
         /*
          * Return outcome of the function
@@ -972,7 +960,6 @@ int session_close(struct file *file, fl_owner_t id) {
  */
 
 void session_init(struct session *session, void *buffer, const char __user *filename, int order) {
-
 
         /*
          * Initialize the spinlock
@@ -1009,7 +996,6 @@ void session_init(struct session *session, void *buffer, const char __user *file
          */
 
         session->limit = (1 << order) * PAGE_SIZE;
-        printk(KERN_INFO "counter:%d\n",session->limit);
 
         /*
          * Store the order
@@ -1041,9 +1027,25 @@ void session_init(struct session *session, void *buffer, const char __user *file
  *
  * @file: pointer to file struct of the file opened adopting a session semantics
  * @session: pointer to the current session object
+ *
+ * Returns 0 in case of success, -ENOMEM in case not enough memory is available
+ * to allocate the new file operations
  */
 
-void install_session_operations(struct file *file, struct session *session) {
+int session_install_operations(struct file *file, struct session *session) {
+
+        /*
+         * Pointer to new structure for file operations
+         */
+
+        struct file_operations *f_ops;
+
+        /*
+         * Save function pointers to the original file operations into the
+         * session object: they will be restored when the session is over
+         */
+
+        session->f_ops_old = file->f_op;
 
         /*
          * Allocate memory for the new file operations structure
@@ -1052,17 +1054,18 @@ void install_session_operations(struct file *file, struct session *session) {
         f_ops = kmalloc(sizeof(struct file_operations), GFP_KERNEL);
 
         /*
+         * Check if memory is available to allocate the new file operations
+         */
+
+        if(!f_ops)
+                return -ENOMEM;
+
+        /*
          * Inherit file operations
          */
 
         *f_ops = *file->f_op;
 
-        /*
-         * Save function pointers for original "write"
-         * into the session object
-         */
-
-        session->write = f_ops->write;
         /*
          * Change pointer for read,write, llseek and flush
          */
@@ -1070,13 +1073,29 @@ void install_session_operations(struct file *file, struct session *session) {
         f_ops->read = session_read;
         f_ops->write = session_write;
         f_ops->llseek = session_llseek;
-        //f_ops->flush=session_close;
+        f_ops->flush=session_close;
 
         /*
          * Install the new structure for file operations
          */
 
         file->f_op = (const struct file_operations *) f_ops;
+
+        /*
+         * Store the pointer to the new structure in the session
+         * object in order to easily restore original operations
+         * when the session is over and also in order to release
+         * allocates memory
+         */
+
+        session->f_ops_new=f_ops;
+
+        /*
+         * File operations successfully installed: return 0
+         */
+
+        return 0;
+
 }
 
 /*
@@ -1096,15 +1115,33 @@ void install_session_operations(struct file *file, struct session *session) {
  *
  * @file: pointer to the struct file of the file involved in the session
  * @session: pointer to the session object
+ *
+ * Returns 0 in case of success, -ENOMEM in case allocation of data
+ * structures fails
  */
 
-void session_install(struct file *file, struct session *session) {
+int session_install(struct file *file, struct session *session) {
+
+
+        /*
+         * Return value
+         */
+
+        int ret;
 
         /*
          * Install the new functions
          */
 
-        install_session_operations(file, session);
+        ret=session_install_operations(file, session);
+
+        /*
+         * Check if new file operations have been properly
+         * installed: if not, return error code
+         */
+
+        if(ret)
+                return ret;
 
         /*
          * Install the session object into the opened file
@@ -1113,10 +1150,24 @@ void session_install(struct file *file, struct session *session) {
         file->private_data = session;
 
         /*
+         * Store the pointer to the structure "file" into the
+         * session object
+         */
+
+        session->file=file;
+
+        /*
          * Connect the session object to the list of all the
          * opened sessions
          */
+
         list_add(&session->link_to_list, &sessions_list->sessions_head);
+
+        /*
+         * New session has been successfully installed: return 0
+         */
+
+        return 0;
 }
 
 /*
@@ -1130,13 +1181,13 @@ void session_install(struct file *file, struct session *session) {
  * corresponding data structures and free allocated memory
  */
 
-void cleanup_sessions(void) {
+void sessions_remove(void) {
 
         /*
          * Pointer to the session object used during iteration
          */
 
-        struct session *session;
+        struct session* session;
 
         /*
         * Temporary pointer used inside "list_for_each_entry_safe"
@@ -1145,26 +1196,23 @@ void cleanup_sessions(void) {
         struct session *temp;
 
         /*
-         * Check if there is an active session
-         */
-
-        /*
          * Iterate through the list of open sessions and release
-         * their buffers
+         * their buffers; for each session object, acquire its
+         * lock before
          */
 
-        list_for_each_entry(session, &sessions_list->sessions_head, link_to_list) {
-                remove_session(session);
+        list_for_each_entry_safe(session,temp,&sessions_list->sessions_head,link_to_list) {
+                spin_lock(&session->lock);
+                session_remove(session);
         }
 
         /*
          * Remove the session list
          */
 
-        printk(KERN_INFO "ok so far2\n");
-        kfree(sessions_list);
-
-        printk(KERN_INFO "done with cleanup sessions\n");
+        if(sessions_list) {
+                kfree(sessions_list);
+        }
 }
 
 
@@ -1236,6 +1284,19 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
         if (flags & SESSION_OPEN && fd > 0) {
 
                 /*
+                 * Boolean flag set it the file is empty
+                 */
+
+                bool empty;
+
+                /*
+                 * Pointer to the descriptor of the first page in the buffer allocated to
+                 * read the file
+                 */
+
+                struct page *first_page;
+
+                /*
                  * This structure contains pointers to the functions used by the VFS layer
                  * in order to ask the I/O block layer to trasnfer data to and from devices
                  */
@@ -1282,13 +1343,6 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 void *va;
 
                 /*
-                 * Structure aimed at keeping track of the virtual address of a page
-                 * in the session buffer
-                 */
-
-                //struct buffer_page* buffer_page;
-
-                /*
                  * Order of pages to be requested to the function "alloc_pages" in order
                  * to store the content of the opened file
                  */
@@ -1306,8 +1360,6 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                  */
 
                 loff_t filesize;
-
-                printk(KERN_INFO "Opening file %s with session semantics\n", filename);
 
                 /*
                  * Get the open file table of the current process
@@ -1343,12 +1395,27 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 filesize = opened_file->f_dentry->d_inode->i_size;
 
                 /*
-                 * Check the size of the file: if it's zero there's nothing
+                 * Check the size of the file: if it's bigger than zero, its content is copied
+                 * into a buffer of dynamically allocated pages and then the session object is
+                 * created; if it's zero, only the session object is created
                  */
 
                 if (!filesize) {
-                        printk(KERN_INFO "SESSION SEMANTICS: File %s has size 0\n");
-                        return fd;
+
+                        /*
+                         * File is empty, so set the corresponding flag
+                         */
+
+                        empty=true;
+                        printk(KERN_INFO "SESSION SEMANTICS: File %s has size 0\n.",filename);
+                }
+                else{
+
+                        /*
+                         * File is empty, so clear the corresponding flag
+                         */
+
+                        empty=false;
                 }
 
                 /*
@@ -1356,7 +1423,6 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                  */
 
                 order = get_order(filesize);
-                printk(KERN_INFO "order:%d\n", order);
 
                 /*
                  * Get 2^order free pages to store the content of the opened file
@@ -1427,81 +1493,66 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 mapping = opened_file->f_mapping;
 
                 /*
-                 * SET THE BUFFER FOR THIS SESSION - start
-                 *
-                 * Copy the content of the opened file into the session buffer, page by page,
-                 * until a number of bytes equal to the filesize has been transferred. At each
-                 * the function "readpage", from the address_space of the file, is used to
-                 * transfer data from the device where the file is stored to the page frame
+                 * Save private data of the opened file (if any)
                  */
 
-                page = first_page;
-                for (i = 0; i < (1 << order); i++) {
+                if(opened_file->private_data) {
+                        session->private=opened_file->private_data;
+                }
 
-                        printk(KERN_INFO "kmap page:%lu\n", page);
+                /*
+                 * If the file is not empty, copy it content into the allocated
+                 * session buffer
+                 */
 
-                        /*
-                         * Lock the page before accessing it
-                         */
-
-                        __set_page_locked(page);
-
-                        /*
-                         * Initialize the address_space structure of the new
-                         * page to the one of the opened file; also set its
-                         * index field, which represents the offset of the page
-                         * with respect to the beginning of the file (in terms
-                         * of pages)
-                         */
-
-                        page->mapping = mapping;
-                        page->index = i;
+                if(!empty) {
 
                         /*
-                         * Copy the content of the file to the newly allocated pages
-                         * using the readpage: this is a low-level function which wraps
-                         * the function provided by the filesystem to read the content
-                         * of its files into memory
+                         * SET THE BUFFER FOR THIS SESSION - start
                          *
-                         * This function creates an instance of the "struct bio" which
-                         * represents an I/O request to a block device (like an hard disk)
-                         * and submits this request to the controller of the device
-                         *
-                         * The function returns 0 when the request is successfully submitted:
-                         * if this it not the case, we return the error code -EIO (I/O error)
-                         * and release the allocated pages, although this should be unlikely.
-                         * Also release the lock on the open file table of the current process
+                         * Copy the content of the opened file into the session buffer, page by page,
+                         * until a number of bytes equal to the filesize has been transferred. At each
+                         * the function "readpage", from the address_space of the file, is used to
+                         * transfer data from the device where the file is stored to the page frame
                          */
 
-                        ret = mapping->a_ops->readpage(opened_file, page);
-                        if (ret) {
-                                __free_pages(first_page, order);
-                                //spin_unlock(&files->file_lock);
-                                printk(KERN_INFO "System call sys_session_open returned this value:%d\n", ret);
-                                ret = -EIO;
-                                return ret;
-                        }
-
-                        /*
-                         * When the I/O request to the device has been successfully completed,
-                         * the bit "PG_uptodate" in the flag of the page descriptor is set.
-                         * Also, when the I/O request has been completed, the PG_locked bit in
-                         * the flag of the page is cleared => in order to be sure that our I/O
-                         * has been completed, the process goes to sleep using the value of the
-                         * bit as condition => the process is woken up when the page gets unlocked.
-                         * We use the function "lock_page_killable" to implement this mechanism
-                         */
-
-                        if (!PageUptodate(page)) {
-                                ret = lock_page_killable(page);
+                        page = first_page;
+                        for (i = 0; i < (1 << order); i++) {
 
                                 /*
-                                 * When the process is woken up we check the response of the I/O
-                                 * request: in case of error release the pages and return -EIO
-                                 * Also release the lock on the open file table of the current
-                                 * process
+                                 * Lock the page before accessing it
                                  */
 
+                                __set_page_locked(page);
+
+                                /*
+                                 * Initialize the address_space structure of the new
+                                 * page to the one of the opened file; also set its
+                                 * index field, which represents the offset of the page
+                                 * with respect to the beginning of the file (in terms
+                                 * of pages)
+                                 */
+
+                                page->mapping = mapping;
+                                page->index = i;
+
+                                /*
+                                 * Copy the content of the file to the newly allocated pages
+                                 * using the readpage: this is a low-level function which wraps
+                                 * the function provided by the filesystem to read the content
+                                 * of its files into memory
+                                 *
+                                 * This function creates an instance of the "struct bio" which
+                                 * represents an I/O request to a block device (like an hard disk)
+                                 * and submits this request to the controller of the device
+                                 *
+                                 * The function returns 0 when the request is successfully submitted:
+                                 * if this it not the case, we return the error code -EIO (I/O error)
+                                 * and release the allocated pages, although this should be unlikely.
+                                 * Also release the lock on the open file table of the current process
+                                 */
+
+                                ret = mapping->a_ops->readpage(opened_file, page);
                                 if (ret) {
                                         __free_pages(first_page, order);
                                         //spin_unlock(&files->file_lock);
@@ -1511,36 +1562,80 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                                 }
 
                                 /*
-                                 * Unlock the page and wake up other processes waiting to access
-                                 * the page (if any)
+                                 * When the I/O request to the device has been successfully completed,
+                                 * the bit "PG_uptodate" in the flag of the page descriptor is set.
+                                 * Also, when the I/O request has been completed, the PG_locked bit in
+                                 * the flag of the page is cleared => in order to be sure that our I/O
+                                 * has been completed, the process goes to sleep using the value of the
+                                 * bit as condition => the process is woken up when the page gets unlocked.
+                                 * We use the function "lock_page_killable" to implement this mechanism
                                  */
 
-                                unlock_page(page);
+                                if (!PageUptodate(page)) {
+                                        ret = lock_page_killable(page);
+
+                                        /*
+                                         * When the process is woken up we check the response of the I/O
+                                         * request: in case of error release the pages and return -EIO
+                                         * Also release the lock on the open file table of the current
+                                         * process
+                                         */
+
+                                        if (ret) {
+                                                __free_pages(first_page, order);
+                                                //spin_unlock(&files->file_lock);
+                                                printk(KERN_INFO "System call sys_session_open returned this value:%d\n",
+                                                       ret);
+                                                ret = -EIO;
+                                                return ret;
+                                        }
+
+                                        /*
+                                         * Unlock the page and wake up other processes waiting to access
+                                         * the page (if any)
+                                         */
+
+                                        unlock_page(page);
+                                }
+
+                                /*
+                                 * Release the lock on the open file table of the current process
+                                 */
+
+                                //spin_unlock(&files->file_lock);
+
+                                /*
+                                 * Go to next page
+                                 */
+
+                                page += 1;
                         }
 
                         /*
-                         * Release the lock on the open file table of the current process
+                         * SET THE BUFFER FOR THIS SESSION - end
                          */
 
-                        //spin_unlock(&files->file_lock);
-
-                        /*
-                         * Go to next page
-                         */
-
-                        page += 1;
                 }
 
                 /*
-                 * SET THE BUFFER FOR THIS SESSION - end
+                 * Install the session in the opened file
                  */
 
+                ret=session_install(opened_file, session);
 
-                 /*
-                  * Install the session in the opened file
-                  */
+                /*
+                 * Check if the session has been properly installed:
+                 * if not, return corresponding error code
+                 */
 
-                session_install(opened_file, session);
+                if(ret)
+                        return ret;
+
+                /*
+                 * The session has been successfully opened: return file descriptor
+                 * of the file that is now opened adopting the session semantics
+                 */
+
                 printk(KERN_INFO "System call sys_session_open returned this value:%d\n", fd);
         }
 

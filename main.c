@@ -87,10 +87,18 @@ int init_module(void) {
         sessions_list=kmalloc(sizeof(struct sessions_list),GFP_KERNEL);
 
         /*
-         * Initialize its
+         * Check if enough memory is available to store the new object:
+         * if not, return the error code -ENOMEM
          */
 
-        init_sessions(sessions_list);
+        if(!sessions_list)
+                printk(KERN_INFO "Module \"session_module\" could not be inserted. Error code:%d",-ENOMEM);
+
+        /*
+         * Initialize the object to track active sessions
+         */
+
+        sessions_list_init(sessions_list);
 
         /*
          * Log message about our just inserted module
@@ -134,7 +142,7 @@ void cleanup_module(void) {
          * Remove the data structures associated to the session semantics
          */
 
-        cleanup_sessions();
+        sessions_remove();
 
         printk(KERN_INFO "Module \"session_module\" removed: restored system call table\n");
 
