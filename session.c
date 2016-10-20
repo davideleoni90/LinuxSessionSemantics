@@ -19,6 +19,7 @@
 #include <linux/backing-dev.h>
 #include <linux/swap.h>
 #include <linux/slab.h>
+#include <linux/fcntl.h>
 #include "session.h"
 
 extern asmlinkage long (*truncate_call)(const char *path, long length);
@@ -29,8 +30,8 @@ extern asmlinkage long (*truncate_call)(const char *path, long length);
  * Free the buffer associated to the session, restore the original file
  * operations in the file opened and free the ession object itself.
  *
- * THIS HAS TO BE CALLED HOLDING THE LOCK ON THE SESSSION OBJECT; THE
- * LOCK IS RELEASED WITHIN THIS FUNCTION
+ * THIS HAS TO BE CALLED HOLDING THE MUTEX ON THE SESSION OBJECT; THE
+ * MUTEX IS RELEASED WITHIN THIS FUNCTION
  */
 
 void session_remove(struct session *session) {
@@ -100,15 +101,16 @@ void session_remove(struct session *session) {
         list_del(&session->link_to_list);
 
         /*
-         * Release lock on the session object
+         * Release the mutex on the session object
          */
 
-        spin_unlock(&session->lock);
+        mutex_unlock(&session->mutex);
 
         /*
          * Remove the session object itself
          */
 
+        printk(KERN_INFO "SESSION SEMANTICS->session for file \"%s\" is over\n",session->file->f_dentry->d_name.name);
         kfree(session);
 }
 
@@ -152,7 +154,7 @@ void sessions_list_init(struct sessions_list *sessions) {
  * the user-space buffer, starting from the offset indicated in the session object
  *
  * In order to avoid race conditions among processes sharing the same struct file
- * associated to the opened file, a spinlock has to be acquired first
+ * associated to the opened file, a mutex has to be acquired first
  *
  * @file: pointer to the file object to be read
  * @buf: user-space buffer where the read content has to be placed
@@ -161,7 +163,7 @@ void sessions_list_init(struct sessions_list *sessions) {
  * this parameter corresponds to the file pointer used in usual I/O operations, so
  * we ignore it
  *
- * Returns number of bytes copied to given buffer or -EINVAL in case the file does
+ * Returns number of bytes copied to given buffer, -EINVAL in case the file does
  * not contain a reference to the session object
  *
  */
@@ -217,17 +219,27 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
         }
 
         /*
-         * Acquire the lock over the session object
+         * Acquire the exclusive access over the session object
          */
 
-        spin_lock(&session->lock);
+        mutex_lock(&session->mutex);
+
+        /*
+         * Check if the file is empty: is so, just return 0 and release
+         * mutex
+         */
+
+        if(!session->filesize){
+                printk(KERN_INFO "SESSION SEMANTICS->session_read read %d bytes because file is empty\n", 0);
+                mutex_unlock(&session->mutex);
+                return 0;
+        }
 
         /*
          * Get the value of the file pointer for the current session
          */
 
         file_pointer = session->position;
-        printk(KERN_INFO "Position before:%d\n", file_pointer);
 
         /*
          * Get the position within the file corresponding to the file pointer
@@ -237,7 +249,7 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
 
         /*
          * If the number of bytes requested is beyond the limit of the file,
-         * shrink the "size" parameter to a suitable value
+         * shrink the "size" parameter to a maximum possible value
          */
 
         if (file_pointer + size > session->filesize) {
@@ -284,7 +296,7 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
                          * Update counter
                          */
 
-                        left_to_read = size - ret;
+                        left_to_read = left_to_read - ret;
                 } while (left_to_read >= 4095);
 
                 /*
@@ -347,13 +359,12 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
          */
 
         session->position += (loff_t) ret;
-        printk(KERN_INFO "pos:%d", session->position);
 
         /*
-         * Release the lock over the session object
+         * Release the mutex over the session object
          */
 
-        spin_unlock(&session->lock);
+        mutex_unlock(&session->mutex);
 
         /*
          * Return the number of bytes copied
@@ -369,7 +380,7 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
  * file pointer of the session has to be updated.
  *
  * In order to avoid race conditions among processes sharing the same struct file
- * associated to the opened file, a spinlock has to be acquired first
+ * associated to the opened file, a mutex has to be acquired first
  *
  * @file: pointer to the file object to be written
  * @buf: user-space buffer containing content to be written
@@ -426,7 +437,6 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
          * Get the session object from the opened file
          */
 
-
         session = file->private_data;
 
         /*
@@ -439,16 +449,22 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
         }
 
         /*
-         * Acquire the lock over the session object
+         * Acquire the mutex over the session object
          */
 
-        spin_lock(&session->lock);
+        mutex_lock(&session->mutex);
 
         /*
          * Get the value of the file pointer for the current session
          */
 
         file_pointer = session->position;
+
+        /*
+         * Get the limit of the allocated buffer for the current session
+         */
+
+        limit=session->limit;
 
         /*
          * Get the position within the file corresponding to the file pointer
@@ -461,11 +477,16 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
          * the amount of bytes to write to a suitable size
          */
 
-        if (file_pointer + size > session >= limit) {
+        if (file_pointer + size >= limit) {
+
                 size = limit - file_pointer;
         }
 
-        printk(KERN_INFO "SIZE:%d\n", size);
+        if(!size){
+                ret=-EINVAL;
+                printk(KERN_INFO "SESSION SEMANTICS->session_write wrote returned error %d\nReached limit of the buffer\n", ret);
+                return ret;
+        }
 
         /*
          * If the requested size is bigger than PAGE_SIZE, it is necessary to
@@ -506,8 +527,7 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
                          * Update counter
                          */
 
-                        left_to_write = size - ret;
-                        printk(KERN_INFO "LEft:%d\n", left_to_write);
+                        left_to_write = left_to_write - ret;
                 } while (left_to_write >= 4095);
 
                 /*
@@ -515,8 +535,6 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
                  */
 
                 if (left_to_write) {
-
-                        printk(KERN_INFO "LEft:%d\n", left_to_write);
 
                         /*
                          * Read remaining bytes
@@ -547,8 +565,6 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
                 }
                 else {
 
-                        printk(KERN_INFO "LEft:%d\n", left_to_write);
-
                         /*
                          * The whole file was written
                          */
@@ -574,18 +590,19 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
          * session buffer
          */
 
-        //session->position+=(loff_t)ret;
+        session->position+=(loff_t)ret;
 
         /*
-         * If the file pointer now points to an offset greater than the offset
-         * stored in the "filesize" field it means the file changed its size
+         * If the file pointer now points to an offset greater or equal than
+         * the offset stored in the "filesize" field (recall that offset of
+         * file starts from zero, so if file pointer is equal to filesize it
+         * means the file changed its size
          * so we have to update the "filesize" field
          */
 
-        printk(KERN_INFO "Ok\n");
-
-        if (session->position > session->filesize)
+        if (session->position > session->filesize){
                 session->filesize = session->position;
+        }
 
         /*
          * Set the "dirty" flag of the session buffer because it has been
@@ -596,16 +613,15 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
         session->dirty = true;
 
         /*
-         * Relase the lock over the session object
+         * Release the exclusive lock over the session object
          */
 
-        spin_unlock(&session->lock);
+        mutex_unlock(&session->mutex);
 
         /*
          * Return the number of bytes copied
          */
 
-        printk(KERN_INFO "SESSION SEMANTICS->session_write wrote %d bytes\n", ret);
         return ret;
 }
 
@@ -615,7 +631,7 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
  * mode specified as parameter
  *
  * In order to avoid race conditions among processes sharing the same struct file
- * associated to the opened file, a spinlock has to be acquired first
+ * associated to the opened file, a mutex has to be acquired first
  *
  * @file: pointer to the file object to be written
  * @offset: the size of the shift of the file pointer
@@ -668,10 +684,10 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
         }
 
         /*
-         * Acquire the lock over the session object
+         * Acquire the mutex over the session object
          */
 
-        spin_lock(&session->lock);
+        mutex_lock(&session->mutex);
 
         /*
          * Get the value of the file pointer for the current session
@@ -689,12 +705,12 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
 
                         /*
                          * Return -EINVAL if the new requested position for the file pointer is beyond the actual
-                         * limits of the opened file; also release lock on session object
+                         * limits of the opened file; also release mutex on session object
                          */
 
-                        if ((offset > 0) || (file_pointer + offset < 0)) {
+                        if ((offset > 0) || (offset <= -(session->filesize))) {
                                 printk(KERN_INFO "SESSION SEMANTICS->session_llseek returned an error: %d\n", -EINVAL);
-                                spin_unlock(&session->lock);
+                                mutex_unlock(&session->mutex);
                                 return -EINVAL;
                         }
 
@@ -709,12 +725,12 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
 
                         /*
                          * Return -EINVAL if the new requested position for the file pointer is beyond the actual
-                         * limits of the opened file; also release lock on session object
+                         * limits of the opened file; also release mutex on session object
                          */
 
                         if ((file_pointer + offset >= session->filesize) || (file_pointer + offset < 0)) {
                                 printk(KERN_INFO "SESSION SEMANTICS->session_llseek returned an error: %d\n", -EINVAL);
-                                spin_unlock(&session->lock);
+                                mutex_unlock(&session->mutex);
                                 return -EINVAL;
                         }
 
@@ -723,18 +739,20 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
                          */
 
                         session->position += offset;
+                        printk(KERN_INFO "lseek:%d char:%c\n",session->position,((char*)(session->buffer))[session->position]);
                         break;
                 }
                 case SEEK_SET: {
 
                         /*
                          * Return -EINVAL if the new requested position for the file pointer is beyond the actual
-                         * limits of the opened file; also release lock on session object
+                         * limits of the opened file; also release mutex on session object
                          */
 
-                        if ((offset < 0) || (file_pointer + offset >= session->filesize)) {
+                        printk("filesize:%d\n",session->filesize);
+                        if ((offset < 0) || (offset >= session->filesize)) {
                                 printk(KERN_INFO "SESSION SEMANTICS->session_llseek returned an error: %d\n", -EINVAL);
-                                spin_unlock(&session->lock);
+                                mutex_unlock(&session->mutex);
                                 return -EINVAL;
                         }
 
@@ -749,15 +767,16 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
         }
 
         /*
-         * Relase the lock over the session object
+         * Release the mutex over the session object
          */
 
-        spin_unlock(&session->lock);
+        mutex_unlock(&session->mutex);
 
         /*
          * Return the new value of the file pointer
          */
 
+        printk(KERN_INFO "SESSION SEMANTICS->session_llseek set new position to: %d\n", session->position);
         return session->position;
 }
 
@@ -780,7 +799,8 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
  * in order to be compliant with the session semantics: in fact this is
  * the only way to ensure that modifications made to the original file
  * while it was opened in the session are made visible to the other
- * processes when the session is over
+ * processes when the session is over.
+ * The system call "sys_truncate" is used to truncate the file
  *
  * @file: pointer to struct file of the opened file whose session has to
  * be flushed
@@ -789,7 +809,8 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
  *
  * Returns 0 in case of success, -EINVAL is the the session object is not
  * valid and -EIO in case the whole buffer can't be flushed to the original
- * file
+ * file. Moreover, in case the system call "sys_truncate" fails, its error
+ * code is returned.
  */
 
 int session_close(struct file *file, fl_owner_t id) {
@@ -843,11 +864,11 @@ int session_close(struct file *file, fl_owner_t id) {
         ret = 0;
 
         /*
-         * Acquire the lock over the session object: in this way we can be sure
+         * Acquire the mutex over the session object: in this way we can be sure
          * that any other conflicting session operation is finished
          */
 
-        spin_lock(&session->lock);
+        mutex_lock(&session->mutex);
 
         /*
          * Check the dirty flag of the session object: if dirty, modifications
@@ -860,7 +881,7 @@ int session_close(struct file *file, fl_owner_t id) {
                  * Current file pointer in the session buffer
                  */
 
-                loff_t off;
+                loff_t off=0;
 
                 /*
                  * Pointer to the session buffer
@@ -875,11 +896,31 @@ int session_close(struct file *file, fl_owner_t id) {
                 size_t filesize;
 
                 /*
-                 * Truncate the file to 0 length before flushing content
+                 * Since we are now going to invoke two system calls
+                 * (write and truncate) that expect a buffer from the
+                 * user space, we first have to mark the kernel space
+                 * (where is actually the buffer given to them) as safe
+                 */
+
+                segment = get_fs();
+                set_fs(KERNEL_DS);
+
+                /*
+                 * Truncate file to zero length before flushing the content
                  */
 
                 ret = truncate_call(session->filename, 0);
-                printk(KERN_INFO "TRUNCATED!!!\n");
+
+                /*
+                 * Return error code if truncate fails; before the
+                 * session has to be unlocked
+                 */
+
+                if(!ret) {
+                        set_fs(segment);
+                        mutex_unlock(&session->mutex);
+                        printk(KERN_INFO "SESSION SEMANTICS->session_close returned error: %d\n", ret);
+                }
 
                 /*
                  * Initialize parameters for the write operation from the session
@@ -891,19 +932,12 @@ int session_close(struct file *file, fl_owner_t id) {
                 off = file->f_pos;
 
                 /*
-                 * Mark the kernel space buffer (from which we want to copy bytes to
-                 * the original file) as safe one
-                 */
-
-                segment = get_fs();
-                set_fs(KERNEL_DS);
-
-                /*
                  * Write content to the file using the original write operation
-                 * of the opened file
+                 * of the opened file: the number of written values is returned.
+                 * First the memory segment has to be set.
                  */
 
-                printk("params-> buf:%lu filesize:%d off:%d", buffer, filesize, off);
+                set_fs(KERNEL_DS);
                 ret = session->f_ops_old->write(file, buffer, filesize, &off);
 
                 /*
@@ -914,7 +948,7 @@ int session_close(struct file *file, fl_owner_t id) {
 
                 /*
                  * If the number of bytes flushed to the original file is less
-                 * than the size of the buffer, return -EIO (I/O errror)
+                 * than the size of the buffer, return -EIO (I/O error)
                  */
 
                 if (ret < session->filesize)
@@ -925,7 +959,7 @@ int session_close(struct file *file, fl_owner_t id) {
          * Unlock the session
          */
 
-        //spin_unlock(&session->lock);
+        //mutex_unlock(&session->mutex);
 
         /*
          * Remove the session object and its associated data structures
@@ -949,8 +983,7 @@ int session_close(struct file *file, fl_owner_t id) {
  * SESSION INIT - start
  *
  * Set the buffer used by the session to the pages filled with the content of the
- * file and initialize the spinlock in order to synchronize access to the buffer
- * itself
+ * file and initialize its mutex semaphore
  *
  * @session: session object to be initialized
  * @buffer: virtual address of the contiguous address space to be used as buffer
@@ -962,10 +995,16 @@ int session_close(struct file *file, fl_owner_t id) {
 void session_init(struct session *session, void *buffer, const char __user *filename, int order) {
 
         /*
-         * Initialize the spinlock
+         * Length of the string representing the filename
          */
 
-        spin_lock_init(&session->lock);
+        int length;
+
+        /*
+         * Initialize the mutex
+         */
+
+        mutex_init(&session->mutex);
 
         /*
          * Set the buffer
@@ -986,10 +1025,22 @@ void session_init(struct session *session, void *buffer, const char __user *file
         session->dirty = false;
 
         /*
-         * Set the filename
+         * Get the length of the string representing the filename
          */
 
-        session->filename = filename;
+        length=strlen(filename);
+
+        /*
+         * Dynamically allocate a string to store the filename
+         */
+
+        session->filename=kmalloc(length,GFP_KERNEL);
+
+        /*
+         * Store the filename into the session
+         */
+
+        copy_from_user(session->filename,filename,length);
 
         /*
          * Set the limit of the offset
@@ -1198,11 +1249,11 @@ void sessions_remove(void) {
         /*
          * Iterate through the list of open sessions and release
          * their buffers; for each session object, acquire its
-         * lock before
+         * mutex before
          */
 
         list_for_each_entry_safe(session,temp,&sessions_list->sessions_head,link_to_list) {
-                spin_lock(&session->lock);
+                mutex_lock(&session->mutex);
                 session_remove(session);
         }
 
@@ -1269,7 +1320,7 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
 
         if (flags & SESSION_OPEN) {
                 fd = previous_open(filename, flags & ~SESSION_OPEN, mode);
-                printk(KERN_INFO "SESSION SEMANTICS:Flags for filename %s: %d; file descriptor:%d\n", filename,
+                printk(KERN_INFO "SESSION SEMANTICS:Flags for filename \"%s\": %d; file descriptor:%d\n", filename,
                        flags & ~SESSION_OPEN, fd);
         }
         else {
@@ -1282,12 +1333,6 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
          */
 
         if (flags & SESSION_OPEN && fd > 0) {
-
-                /*
-                 * Boolean flag set it the file is empty
-                 */
-
-                bool empty;
 
                 /*
                  * Pointer to the descriptor of the first page in the buffer allocated to
@@ -1403,32 +1448,32 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 if (!filesize) {
 
                         /*
-                         * File is empty, so set the corresponding flag
+                         * File is empty, allocate only one page; order is 0
                          */
 
-                        empty=true;
-                        printk(KERN_INFO "SESSION SEMANTICS: File %s has size 0\n.",filename);
+                        printk(KERN_INFO "SESSION SEMANTICS-> File \"%s\" has size 0\n",filename);
+                        first_page = alloc_pages(GFP_KERNEL, 0);
+                        order=0;
                 }
                 else{
 
                         /*
-                         * File is empty, so clear the corresponding flag
+                         * File is not empty, so allocate as many pages as
+                         * necessary to store the file
                          */
 
-                        empty=false;
+                        /*
+                         * Get the order of pages to be allocated using alloc_pages
+                         */
+
+                        order = get_order(filesize);
+
+                        /*
+                         * Get 2^order free pages to store the content of the opened file
+                         */
+
+                        first_page = alloc_pages(GFP_KERNEL, order);
                 }
-
-                /*
-                 * Get the order of pages to be allocated using alloc_pages
-                 */
-
-                order = get_order(filesize);
-
-                /*
-                 * Get 2^order free pages to store the content of the opened file
-                 */
-
-                first_page = alloc_pages(GFP_KERNEL, order);
 
                 /*
                  * Check that the pages have been successfully allocated:
@@ -1505,7 +1550,7 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                  * session buffer
                  */
 
-                if(!empty) {
+                if(!filesize) {
 
                         /*
                          * SET THE BUFFER FOR THIS SESSION - start

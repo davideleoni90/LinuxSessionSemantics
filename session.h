@@ -25,8 +25,10 @@ extern struct sessions_list* sessions_list;
  *
  * order: the buffer session is made of 1<<order pages
  *
- * lock: spinlock to be used to synchronize read and write operations on the
- * file during a session
+ * mutex: semaphore to be used to synchronize read and write operations on the
+ * file during a session; a spinlock can't be used because the functions used
+ * to copy data to and from the session inside the critical sections may put
+ * the process to sleep and this is not compatible with spinlocks
  *
  * position: offset with respect to the beginning of the file from which
  * the next I/O operation will take place during a session
@@ -62,7 +64,7 @@ struct session{
         void* buffer;
         struct page* pages;
         int order;
-        spinlock_t lock;
+        struct mutex mutex;
         loff_t position;
         loff_t filesize;
         int limit;
@@ -70,7 +72,7 @@ struct session{
         struct file_operations *f_ops_new;
         bool dirty;
         struct list_head link_to_list;
-        const char __user* filename;
+        char *filename;
         struct file *file;
         void* private;
 };
