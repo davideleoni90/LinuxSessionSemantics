@@ -9,7 +9,7 @@ The author of this project is <a href="https://www.linkedin.com/in/leonidavide">
 </p>
 <h2>Overview</h2>
 <p align="justify">
-This project is aimed at the introduction of a <i>session semantics<i> for files into the the Linux Kernel, by mean of a dedicated module.
+This project is aimed at the introduction of a <i>session semantics</i> for files into the the Linux Kernel, by mean of a dedicated module.
 </p>
 <h2>Specifics</h2>
 <p align="justify">
