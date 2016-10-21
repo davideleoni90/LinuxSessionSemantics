@@ -89,19 +89,6 @@ struct sessions_list{
 };
 
 /*
- * Structure to keep track of each page of the session buffer
- *
- * buffer_head: head of the doubly linked list that keeps track of all pages in
- * a session buffer
- * page_address: virtual address of the page of the session buffer
- */
-
-struct buffer_page{
-        struct list_head buffer_head;
-        void* page_address;
-};
-
-/*
  * FUNCTION PROTOTYPES - start
  */
 
