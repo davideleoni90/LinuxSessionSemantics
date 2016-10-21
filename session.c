@@ -1413,15 +1413,6 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 files = current->files;
 
                 /*
-                 * Get exclusive access to the open file table of the
-                 * current process: this is necessary in order to avoid
-                 * race conditions in case a file gets closed in the
-                 * meantime
-                 */
-
-                //spin_lock(&files->file_lock);
-
-                /*
                  * Get the table of file descriptors
                  */
 
@@ -1448,11 +1439,12 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 if (!filesize) {
 
                         /*
-                         * File is empty, allocate only one page; order is 0
+                         * File is empty, allocate only four pages in case new content has
+                         * to be added; order is 2
                          */
 
                         printk(KERN_INFO "SESSION SEMANTICS-> File \"%s\" has size 0\n",filename);
-                        first_page = alloc_pages(GFP_KERNEL, 0);
+                        first_page = alloc_pages(GFP_KERNEL, 2);
                         order=0;
                 }
                 else{
@@ -1470,9 +1462,11 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
 
                         /*
                          * Get 2^order free pages to store the content of the opened file
+                         * and add an equal number of pages in case new content has to be
+                         * added
                          */
 
-                        first_page = alloc_pages(GFP_KERNEL, order);
+                        first_page = alloc_pages(GFP_KERNEL, order+1);
                 }
 
                 /*
@@ -1488,7 +1482,7 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
                 }
 
                 /*
-                 * Pages are mapped in th virtual address space one after the other
+                 * Pages are mapped in the virtual address space one after the other
                  * so we only need the virtual address of the first page
                  */
 
@@ -1642,12 +1636,6 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
 
                                         unlock_page(page);
                                 }
-
-                                /*
-                                 * Release the lock on the open file table of the current process
-                                 */
-
-                                //spin_unlock(&files->file_lock);
 
                                 /*
                                  * Go to next page
