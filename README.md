@@ -22,6 +22,7 @@ In order to ensure that during a session a process can work on its "personal cop
 <h2>Implementation</h2>
 <p align="justify">
 No limit is imposed on the number of file sessions that can be opened at any time nor on the size of the file that can be opened using the session semantics, except for the obvious limit imposed by the available memory.
+The size of the buffer reserved for each session is dynamically allocated when the session is opened and does not change: the amount of allocated is 4KB for empty files and the double of the file size for not empty files.
 <br>
 When then module gets removed from the kernel, all the file sessions currently opened get closed but modifications are not written into original files because this is note explicitely requested with the system call <i>close</i>
 <br>
@@ -30,5 +31,5 @@ As the module is installed into the Linux Kernel, the session semantics can be r
 <h2>How to use</h2>
 <p align="justify">
 The module can be compiled and installed as any other module for the Linux Kernel.
-The module was tested on Linux Kernel 2.6.34, with full preemption and SMP support
+The module was tested on Linux Kernel 2.6.34, with full preemption and SMP support, on x86 machine
 </p>
