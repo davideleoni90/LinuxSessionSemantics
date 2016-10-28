@@ -5,16 +5,19 @@
 #include <fcntl.h>
 #include <linux/ipc.h>
 #include <errno.h>
+#include <unistd.h>
+#include <sys/wait.h>
 
 #define SESSION_OPEN 00000004
 
 int main(int argc, char** argv){
-	int mode,flags,ret,fd;
-	const char* filename;
+        int mode,flags,ret,fd;
+        pid_t pid;
+        const char* filename;
         const char buffer[10];
         const char* new_content;
         if(argc>3){
-		filename = argv[1];
+                filename = argv[1];
                 new_content=argv[2];
                 flags=strtol(argv[3],NULL,10);
                 if(!((flags&O_RDONLY)||(flags&O_WRONLY)||(flags&O_RDWR))) {
@@ -27,7 +30,7 @@ int main(int argc, char** argv){
                 }
                 mode=0;
                 if(argc==5)
-		        mode = strtol(argv[4],NULL,10);
+                        mode = strtol(argv[4],NULL,10);
                 printf("PID of current process:%d\n",getpid());
                 printf("Opening file using session semantics %s with flags %d and mode %d\n",filename,flags,mode);
                 fd=open(filename,flags|SESSION_OPEN,mode);
@@ -56,7 +59,7 @@ int main(int argc, char** argv){
                 }
                 printf("File descriptor:%d\n",fd);
                 printf("Reading \"%s\"\n",filename);
-		ret=read(fd,buffer,10);
+                ret=read(fd,buffer,10);
                 if(!ret){
                         printf("Could not read file because of EOF or empty file\n");
                         return EOF;
@@ -78,16 +81,65 @@ int main(int argc, char** argv){
                 }
                 printf("Bytes read:%d\n",ret);
                 printf("Content read:%s\n",buffer);
-                printf("Writing new content...\n");
-                ret=write(fd,new_content,strlen(new_content));
-                if(ret>=0)
-                        printf("%d bytes written into original file\n",ret);
-                else
-                        printf("Could not write into session because of error:%d\n",ret);
-                sleep(30);
+                pid=fork();
+                if(pid==0){
+
+                        /*
+                         * Child process
+                         */
+
+                        int ret;
+                        const char buffer2[20];
+                        ret=lseek(fd,0,SEEK_SET);
+                        if(ret<0){
+                                switch(errno){
+                                        case EINVAL:{
+                                                printf("CHILD:Error while seeking session: invalid file descriptor or offset\n");
+                                                break;
+                                        }
+                                        default:
+                                                printf("CHILD:Could not seek file because of error:%d\n",errno);
+                                }
+                        }
+                        printf("CHILD:Session pointer:%d\n",ret);
+                        ret=read(fd,buffer2,20);
+                        if(!ret){
+                                printf("CHILD:Could not read file because of EOF or empty file\n");
+                        }
+                        if(ret<0) {
+                                switch(errno){
+                                        case EIO:{
+                                                printf("CHILD:Error while reading session: could not copy some bytes\n");
+                                                break;
+                                        }
+                                        case EINVAL:{
+                                                printf("CHILD:Error while going to sleep on barrier: invalid barrier id or tag\n");
+                                                break;
+                                        }
+                                        default:
+                                                printf("CHILD:Could not read file because of error:%d\n",errno);
+                                }
+                        }
+                        printf("CHILD:Content read:%s\n",buffer2);
+                        printf("CHILD:Value returned:%d\n",ret);
+                }
+                else{
+
+                        /*
+                         * Parent process
+                         */
+
+                        printf("PARENT:Writing new content...\n");
+                        ret=write(fd,new_content,strlen(new_content));
+                        if(ret>=0)
+                                printf("PARENT:%d bytes written into original file\n",ret);
+                        else
+                                printf("PARENT:Could not write into session because of error:%d\n",ret);
+                        wait(NULL);
+                }
                 printf("Now closing session\n");
                 return  ret;
         }
         printf("Invalid arguments: at least provide absolute filepath as first parameter, content to write as second one and flag as third one;\n"
-                               "optionally provide mode as fourth parameter\n");
+                       "optionally provide mode as fourth parameter\n");
 }

@@ -75,6 +75,7 @@ int main(int argc, char** argv){
                         return errno;
                 }
                 printf("Bytes read:%d\n",ret);
+                printf("Now closing session\n");
                 return  ret;
         }
         printf("Invalid arguments: at least provide absolute filepath as first parameter and flag as second one;\n"
