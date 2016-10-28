@@ -20,6 +20,7 @@
 #include <linux/gfp.h>\\
 #include <linux/ipc_namespace.h>
 #include <linux/ipc.h>
+#include <linux/fdtable.h>
 #include <asm-generic/current.h>
 
 #define WP_X86 0x00010000
@@ -108,14 +109,68 @@ unsigned long* find_system_call_table(){
  * FIND ADDRESS OF THE SYSTEM CALL TABLE - end
  */
 
+/*
+ * GET FILE OBJECT - start
+ *
+ * Return the object of type "struct file" associated to the given file
+ * descriptor for the current process
+ *
+ * @fd: file descriptor associated to the opened file in the file table
+ * of the current process
+ */
+
+struct file* get_file_from_descriptor(int fd){
+
+        /*
+         * Pointer to the structure designed to handle opened files of a process
+         */
+
+        struct files_struct *files;
+
+        /*
+         * File descriptors table of the current process
+         */
+
+        struct fdtable *table;
+
+        /*
+         * File object of the opened file
+         */
+
+        struct file *opened_file;
+
+        /*
+         * Get the open file table of the current process
+         */
+
+        files = current->files;
+
+        /*
+         * Get the table of file descriptors
+         */
+
+        table = files_fdtable(files);
+
+        /*
+         * Get the file object corresponding to the opened file
+         */
+
+        opened_file = table->fd[fd];
+
+        /*
+         * Return the file object
+         */
+
+        return opened_file;
+}
+
+/*
+ * GET FILE OBJECT - end
+ */
 
 
 /*
  * ENABLE/DISABLE WRITE-PROTECTED MODE -start
- */
-
-/*
- *
  */
 
 void disable_write_protected_mode(unsigned long* cr0){

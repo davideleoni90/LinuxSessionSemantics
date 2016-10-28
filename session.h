@@ -19,10 +19,6 @@ extern struct sessions_list* sessions_list;
 /*
  * Structure to handle an I/O session on a file
  *
- * buffer: pointer to the content of the file during a session
- *
- * pages: pointer to the page descriptor of the first page in the buffer
- *
  * order: the buffer session is made of 1<<order pages
  *
  * mutex: semaphore to be used to synchronize read and write operations on the
@@ -34,8 +30,6 @@ extern struct sessions_list* sessions_list;
  * the next I/O operation will take place during a session
  *
  * filesize: number of bytes in the file
- *
- * limit: size of the buffer
  *
  * f_ops_old: pointer to the structure containing pointers to original file operations
  * of an opened file; the legacy "write" operations is used to flush content of
@@ -52,6 +46,11 @@ extern struct sessions_list* sessions_list;
  * link_to_list: list_head structure connecting the session object to the list of
  * all session objects
  *
+ * pages: list of objects of type "buffer_page", each corresponding to a page of the
+ * buffer used for I/O sessions
+ *
+ * nr_pages: number of pages in the session buffer
+ *
  * filename: string representing the filename in the user-space
  *
  * file: pointer to the "struct file" associated to the opened file
@@ -61,20 +60,43 @@ extern struct sessions_list* sessions_list;
  */
 
 struct session{
-        void* buffer;
-        struct page* pages;
-        int order;
+        //void* buffer;
+        //struct page* pages;
         struct mutex mutex;
         loff_t position;
         loff_t filesize;
-        int limit;
+        //int limit;
         struct file_operations *f_ops_old;
         struct file_operations *f_ops_new;
         bool dirty;
         struct list_head link_to_list;
-        char *filename;
+        struct list_head pages;
+        int nr_pages;
+        const char *filename;
         struct file *file;
         void* private;
+};
+
+/*
+ * Structure to keep track of all the pages the session buffer is made of
+ *
+ * head: link to to the head of the list of "buffer_pages", stored in the
+ * session object
+ *
+ * buffer_page_descriptor: pointer to the descriptor of the frame associated to this
+ * element
+ *
+ * buffer_page_address: virtual address into which the frame is mapped as
+ * it is allocated for the session
+ *
+ * index: position of the page within the buffer
+ */
+
+struct buffer_page{
+        struct list_head buffer_pages_head;
+        struct page* buffer_page_descriptor;
+        void* buffer_page_address;
+        int index;
 };
 
 /*

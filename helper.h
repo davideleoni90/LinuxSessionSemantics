@@ -19,18 +19,17 @@ asmlinkage long (*truncate_call)(const char * path, long length);
 asmlinkage long (*previous_open)(const char __user* filename,int flags,int mode);
 
 /*
- * Indexes of the system calls table entries modified by the module
- */
-
-unsigned int restore[4];
-
-void make_page_writable(pte_t* page);
-
-/*
  * Find address of the system call table
  */
 
 unsigned long* find_system_call_table(void);
+
+/*
+ * Get file structure associated to given file descriptor
+ * from the table of opened files of the current process
+ */
+
+struct file* get_file_from_descriptor(int fd);
 
 void enable_write_protected_mode(unsigned long* cr0);
 void disable_write_protected_mode(unsigned long* cr0);

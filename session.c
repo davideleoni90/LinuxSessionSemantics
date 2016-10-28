@@ -1,7 +1,6 @@
 #include <linux/fs.h>
 #include <linux/gfp.h>
 #include <asm-generic/current.h>
-#include <linux/fdtable.h>
 #include <linux/sched.h>
 #include <linux/pagemap.h>
 #include <linux/page-flags.h>
@@ -15,20 +14,464 @@
 #include <linux/radix-tree.h>
 #include <asm-generic/bug.h>
 #include <linux/vmstat.h>
-#include <linux/file.h>
 #include <linux/backing-dev.h>
+#include <linux/file.h>
 #include <linux/swap.h>
 #include <linux/slab.h>
 #include <linux/fcntl.h>
 #include "session.h"
 
 extern asmlinkage long (*truncate_call)(const char *path, long length);
+extern struct file* get_file_from_descriptor(int fd);
+
+/*
+ * NEW BUFFER PAGE - start
+ *
+ * Create a new object of type "buffer_page" to keep track of pages of
+ * the session buffer
+ *
+ * @buffer_page_descriptor: pointer to the descriptor associate to the allocated
+ * frame
+ * @index: index of the page within the buffer
+ *
+ * Returns a pointer to the new instance of buffer_page if successful, -ENOMEM if
+ * not enough memory is available for the creation of the new object and -EINVAL
+ * if one of the given pointer is NULL
+ */
+
+struct buffer_page* session_new_buffer_page(void* buffer_page_address,struct page* buffer_page_descriptor,int index){
+
+        /*
+         * Pointer to the new buffer_page object
+         */
+
+        struct buffer_page* buffer_page;
+
+        printk(KERN_INFO "SESSION SEMANTICS->Creating buffer page for address %lu and descriptor %lu, with index %d\n",buffer_page_address,buffer_page_descriptor,index);
+
+        /*
+         * Check if provided addresses are valid: if not, return -EFAULT
+         */
+
+        if((!buffer_page_address)||(!buffer_page_descriptor))
+                return ERR_PTR(-EFAULT);
+
+        /*
+         * Check if provided index is valid: if not, return -EINVAL
+         */
+
+        if(index<0)
+                return ERR_PTR(-EINVAL);
+
+        /*
+         * Allocate a new object of type "buffer_page"
+         */
+
+        buffer_page=kmalloc(sizeof(struct buffer_page),GFP_KERNEL);
+
+        /*
+         * Check if allocation was successful: if not return -ENOMEM
+         */
+
+        if(!buffer_page)
+                return ERR_PTR(-ENOMEM);
+
+        /*
+         * Set the descriptor and address of the buffer page
+         */
+
+        buffer_page->buffer_page_address=buffer_page_address;
+        buffer_page->buffer_page_descriptor=buffer_page_descriptor;
+
+        /*
+         * Set the index of the buffer_page
+         */
+
+        buffer_page->index=index;
+
+        /*
+         * Initialize the "list_head" field
+         */
+
+        INIT_LIST_HEAD(&buffer_page->buffer_pages_head);
+
+        /*
+         * Return the pointer to allocated address
+         */
+
+        printk(KERN_INFO "SESSION SEMANTICS->Created buffer page %d, corresponding to virtual address %lu\n",buffer_page->index,buffer_page->buffer_page_address);
+        return buffer_page;
+}
+
+/*
+ * NEW BUFFER PAGE - end
+ */
+
+/*
+ * CREATE SESSION BUFFER - start
+ *
+ * Allocate a suitable number of pages to store the content of the file in
+ * session
+ *
+ * @filesize: size of the opened file
+ * @filename: filename of the file
+ * @order: pointer to the order variable, that has to be set to the order of
+ * pages allocated
+ *
+ * Returns the pointer to the descriptor of the first page of the buffer,NULL
+ * if not enough memory is available
+ */
+
+struct page* session_create_buffer(int filesize,const char __user *filename,int* order){
+
+        /*
+         * Pointer to the descriptor of the first page in the buffer allocated to
+         * read the file
+         */
+
+        struct page *first_page;
+
+        /*
+         * Check size of the file
+         */
+
+        if (!filesize) {
+
+                /*
+                 * File is empty, allocate only one page; order is 0
+                 */
+
+                printk(KERN_INFO "SESSION SEMANTICS-> File \"%s\" has size 0\n",filename);
+                first_page = alloc_pages(GFP_KERNEL, 0);
+                *order=0;
+        }
+        else{
+
+                /*
+                 * File is not empty, so allocate as many pages as
+                 * necessary to store the actual size of the file
+                 */
+
+                /*
+                 * Get the order of pages to be allocated using alloc_pages
+                 */
+
+                *order = get_order(filesize);
+
+                /*
+                 * Get 2^order free pages to store the content of the opened file
+                 */
+
+                first_page = alloc_pages(GFP_KERNEL, *order);
+        }
+
+        /*
+         * Return pointer to descriptor of the first page
+         */
+
+        return first_page;
+}
+
+/*
+ * CREATE SESSION BUFFER - end
+ */
+
+/*
+ * FILL SESSION BUFFER - start
+ *
+ * Copy the content of the opened file into the session buffer, page by page,
+ * until a number of bytes equal to the filesize has been transferred. At each
+ * the function "readpage", from the address_space of the file, is used to
+ * transfer data from the device where the file is stored to the page frame
+ *
+ * @first_page: pointer to the descriptor of the first page in the buffer
+ * @mapping: pointer to "address_space" structure of the file, containing
+ * pointers to functions to be used for low level I/O operations related to
+ * the file
+ * @order: 2^order pages belong to the buffer
+ * @opened_file: file structure associated to opened file
+ *
+ * Returns 0 if the whole file is copied, an error code otherwise
+ */
+
+int session_fill_buffer(struct page* first_page,int order,struct file *opened_file){
+
+        /*
+         * This structure contains pointers to the functions used by the VFS layer
+         * in order to ask the I/O block layer to transfer data to and from devices
+         */
+
+        struct address_space *mapping;
+
+        /*
+         * Return value
+         */
+
+        int ret;
+
+        /*
+         * Pointer to the page descriptor of the allocated pages; this is
+         * used in the iteration to initialize the session buffer
+         */
+
+        struct page *page;
+
+        /*
+         * Index used to iterate through allocated pages
+         */
+
+        int i;
+
+        /*
+         * Get the address_space structure of the opened file
+         */
+
+        mapping = opened_file->f_mapping;
+
+        /*
+         * Copy the content of the opened file into the session buffer, page by page,
+         * until a number of bytes equal to the filesize has been transferred. At each
+         * the function "readpage", from the address_space of the file, is used to
+         * transfer data from the device where the file is stored to the page frame
+         */
+
+        page = first_page;
+        for (i = 0; i < (1 << order); i++) {
+
+                /*
+                 * Lock the page before accessing it
+                 */
+
+                __set_page_locked(page);
+
+                /*
+                 * Initialize the address_space structure of the new
+                 * page to the one of the opened file; also set its
+                 * index field, which represents the offset of the page
+                 * with respect to the beginning of the file (in terms
+                 * of pages)
+                 */
+
+                page->mapping = mapping;
+                page->index = i;
+
+                /*
+                 * Copy the content of the file to the newly allocated pages
+                 * using the readpage: this is a low-level function which wraps
+                 * the function provided by the filesystem to read the content
+                 * of its files into memory
+                 *
+                 * This function creates an instance of the "struct bio" which
+                 * represents an I/O request to a block device (like an hard disk)
+                 * and submits this request to the controller of the device
+                 *
+                 * The function returns 0 when the request is successfully submitted:
+                 * if this it not the case, we return the error code -EIO (I/O error)
+                 * and release the allocated pages, although this should be unlikely.
+                 * Also release the lock on the open file table of the current process
+                 */
+
+                ret = mapping->a_ops->readpage(opened_file, page);
+                if (ret) {
+
+                        /*
+                         * Return error
+                         */
+
+                        printk(KERN_INFO "SESSION SEMANTICS->Filling buffer returned error:%d\n",ret);
+                        return ret;
+                }
+
+                /*
+                 * When the I/O request to the device has been successfully completed,
+                 * the bit "PG_uptodate" in the flag of the page descriptor is set.
+                 * Also, when the I/O request has been completed, the PG_locked bit in
+                 * the flag of the page is cleared => in order to be sure that our I/O
+                 * has been completed, the process goes to sleep using the value of the
+                 * bit as condition => the process is woken up when the page gets unlocked.
+                 * We use the function "lock_page_killable" to implement this mechanism
+                 */
+
+                if (!PageUptodate(page)) {
+                        ret = lock_page_killable(page);
+
+                        /*
+                         * When the process is woken up we check the response of the I/O
+                         * request: in case of error release the pages and return -EIO
+                         * Also release the lock on the open file table of the current
+                         * process
+                         */
+
+                        if (ret) {
+
+                                /*
+                                 * Return error
+                                 */
+
+                                printk(KERN_INFO "SESSION SEMANTICS->Filling buffer returned error:%d\n",ret);
+                                return ret;
+                        }
+
+                        /*
+                         * Unlock the page and wake up other processes waiting to access
+                         * the page (if any)
+                         */
+
+                        unlock_page(page);
+                }
+
+                /*
+                 * Go to next page
+                 */
+
+                page += 1;
+        }
+
+        /*
+         * The content of the file was fully copied from its storage into the session
+         * without making use of the buffer, so return 0
+         */
+
+        printk(KERN_INFO "SESSION SEMANTICS->Filling buffer was successfull\n");
+        return 0;
+}
+
+/*
+ * FILL SESSION BUFFER - end
+ */
+
+/*
+ * EXPAND SESSION BUFFER - start
+ *
+ * Ask the system for the allocation of new pages, map them and add them to
+ * the buffer of the session object
+ *
+ * @session: pointer to the object representing the current session
+ * @size: number of additional bytes that don't fit into the actual size of
+ * the buffer
+ *
+ * Returns the number of pages added if succeeds, -ENOMEM if not enough memory
+ * is available for the creation of the new object and -EINVAL if the given
+ * pointer is NULL
+ */
+
+int session_expand_buffer(struct session* session, int size){
+
+        /*
+         * 2^(new_order) new pages have to be allocated to
+         * the buffer
+         */
+
+        int new_order;
+
+        /*
+         * Index to iterate through newly allocated pages
+         */
+
+        int i;
+
+        /*
+         * Virtual address of newly allocated pages of the buffer
+         */
+
+        void* new_va;
+
+        /*
+         * Pointer to the descriptor of the first newly allocated page
+         */
+
+        struct page* new_first;
+
+        /*
+         * Check if parameters are valid
+         */
+
+        if((!session)||(!size)){
+
+                /*
+                 * Return -EINVAL if the session object is not set or size is 0
+                 */
+
+                if (!session) {
+                        printk(KERN_INFO "SESSION SEMANTICS->session_expand_buffer: session is NULLL\n", -EINVAL);
+                        return -EINVAL;
+                }
+                if (!session) {
+                        printk(KERN_INFO "SESSION SEMANTICS->session_expand_buffer was passed 0 size\n");
+                        return -EINVAL;
+                }
+        }
+
+        /*
+         * Get the order of pages necessary to store the requested amount of bytes
+         */
+
+        new_order=get_order((loff_t)size);
+
+        /*
+         * Allocated requested pages
+         */
+
+        new_first=alloc_pages(GFP_KERNEL,new_order);
+
+        /*
+         * Map the newly allocated pages into the virtual address
+         */
+
+        new_va=kmap(new_first);
+
+        /*
+         * Create an object "buffer_page" for each newly allocated page and add
+         * it to the buffer of the session
+         */
+
+        for(i=0;i<(1<<new_order);i++){
+
+                /*
+                 * Pointer to the new buffer_page object
+                 */
+
+                struct buffer_page* buffer_page;
+
+                /*
+                 * Create a new "buffer_page" object for each new page of the buffer
+                 */
+
+                buffer_page=session_new_buffer_page(new_va+i*PAGE_SIZE,new_first+i,session->nr_pages+i);
+
+                /*
+                 * Check if the creation of the new object was successful: if not,
+                 * return the associated error code
+                 */
+
+                if(IS_ERR_VALUE(PTR_ERR(buffer_page)))
+                        return PTR_ERR(buffer_page);
+
+                /*
+                 * Add the newly created object to the corresponding list in the session
+                 * object
+                 */
+
+                printk(KERN_INFO "SESSION SEMANTICS->Adding buffer page %d to session\n",buffer_page->index);
+                list_add_tail(&buffer_page->buffer_pages_head,&(session->pages));
+        }
+
+        /*
+         * Buffer was successfully expanded, so return number of new pages
+         */
+
+        return (1<<new_order);
+}
+
+/*
+ * EXPAND SESSION BUFFER - end
+ */
 
 /*
  * REMOVE SESSION - start
  *
  * Free the buffer associated to the session, restore the original file
- * operations in the file opened and free the ession object itself.
+ * operations in the file opened and free the session object itself.
  *
  * THIS HAS TO BE CALLED HOLDING THE MUTEX ON THE SESSION OBJECT; THE
  * MUTEX IS RELEASED WITHIN THIS FUNCTION
@@ -43,37 +486,36 @@ void session_remove(struct session *session) {
         int i = 0;
 
         /*
-         * Set the "mapping" field of the pages of the buffer
-         * to NULL, otherwise "free_pages" complains because
-         * pages are still in used
+         * Pointer to barrier_page tpe, used to iterate through
+         * the pages in the buffer of the session; "temp" is
+         * used in the iteration because we are deleting entries
+         * from the list
          */
 
-        for (i = 0; i < (1 << (session->order)); i++) {
-
-                /*
-                 * Current page descriptor
-                 */
-
-                struct page *page;
-
-                /*
-                 * Get page descriptor of current page
-                 */
-
-                page = session->pages + i;
-
-                /*
-                 * Set mapping to NULL for the current page
-                 */
-
-                page->mapping = NULL;
-        }
+        struct buffer_page* buffer_page;
+        struct buffer_page* temp;
 
         /*
-         * Release buffer
+         * Iterate through the objects of type "buffer_page" stored
+         * in the session object and for each of them:
+         *
+         * 1- set the "mapping" field of the page descriptor to NULL,
+         * otherwise "free_page" complains because the descriptor is
+         * still in use
+         *
+         * 2- release frame associated to the page
+         *
+         * 3- remove page from list of pages in session
+         *
+         * 4- release the buffer_page object itself
          */
 
-        free_pages(session->buffer, session->order);
+        list_for_each_entry_safe(buffer_page,temp,&session->pages,buffer_pages_head){
+                buffer_page->buffer_page_descriptor->mapping=NULL;
+                free_page(buffer_page->buffer_page_address);
+                list_del(&buffer_page->buffer_pages_head);
+                kfree(buffer_page);
+        }
 
         /*
          * Restore original file operations in the opened file
@@ -93,6 +535,11 @@ void session_remove(struct session *session) {
 
         kfree(session->f_ops_new);
 
+        /*
+         * Release memory allocated to store the filename
+         */
+
+        kfree(session->filename);
 
         /*
          * Remove the session object from the global list of sessions
@@ -164,12 +611,13 @@ void sessions_list_init(struct sessions_list *sessions) {
  * we ignore it
  *
  * Returns number of bytes copied to given buffer, -EINVAL in case the file does
- * not contain a reference to the session object
+ * not contain a reference to the session object and -EIO in case not all bytes
+ * requested can be read from session buffer
  *
  */
 
 
-ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *offset) {
+ssize_t session_read(struct file *file, char __user * buf, size_t size, loff_t *offset) {
 
         /*
          * Object representing the current session
@@ -189,6 +637,19 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
          */
 
         void *src;
+
+        /*
+         * Index of the page in the buffer
+         */
+
+        int index;
+
+        /*
+         * Pointer to the buffer_page object corresponding to the actual position
+         * of the session file pointer
+         */
+
+        struct buffer_page* current_page;
 
         /*
          * Return value
@@ -236,20 +697,14 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
         }
 
         /*
-         * Get the value of the file pointer for the current session
+         * Get the file pointer of the current session
          */
 
         file_pointer = session->position;
 
         /*
-         * Get the position within the file corresponding to the file pointer
-         */
-
-        src = session->buffer + file_pointer * sizeof(void);
-
-        /*
-         * If the number of bytes requested is beyond the limit of the file,
-         * shrink the "size" parameter to a maximum possible value
+         * If the number of bytes requested to read is beyond the limit of the file,
+         * shrink the "size" parameter to the maximum possible value
          */
 
         if (file_pointer + size > session->filesize) {
@@ -257,100 +712,198 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
         }
 
         /*
-         * If the requested size is bigger than PAGE_SIZE, it is necessary to
-         * split the reading operations in chunks of 4095 bytes each
+         * Get the index of the page in the buffer corresponding to the session file pointer
          */
 
-        if (size >= PAGE_SIZE) {
+        index=file_pointer/PAGE_SIZE;
+
+        printk(KERN_INFO "SESSION SEMANTICS->Index of first page to read:%d\n", index);
+
+        /*
+         * Get the page of the buffer corresponding to the file pointer
+         */
+
+        list_for_each_entry(current_page,&session->pages,buffer_pages_head) {
+                if (current_page->index == index) {
+                        break;
+                }
+        }
+
+        printk(KERN_INFO "SESSION SEMANTICS->Index of page corresponding to file pointer:%d\n",
+               current_page->index);
+
+        /*
+         * Get the exact location within the buffer from which the requested number of bytes
+         * will be read
+         */
+
+        src = current_page->buffer_page_address + (file_pointer % PAGE_SIZE) * sizeof(void);
+
+        printk(KERN_INFO "SESSION SEMANTICS->Address from which read operation starts:%lu\n",src);
+
+        /*
+         * First copy bytes from the page of the buffer corresponding to the actual position
+         * of the file pointer.
+         *
+         * If the number of bytes requested extends beyond the current page, copy all the bytes
+         * from the current page, starting from the file pointer, and then copy bytes from next
+         * page/s of the buffer, until all requested bytes have been read. Otherwise (i.e. if
+         * all the requested bytes are contained in the current page of the buffer) copy "size"
+         * bytes to the user-space buffer.
+         */
+
+        if((file_pointer % PAGE_SIZE)+size>PAGE_SIZE) {
 
                 /*
-                 * Initially all the bytes have to be read
+                 * Copy first bytes
                  */
 
-                left_to_read = size;
+                ret=copy_to_user(buf, src, PAGE_SIZE - (file_pointer % PAGE_SIZE));
 
                 /*
-                 * With the following loop we read a number
-                 * of bytes that is multiple of 4095.
-                 * Then we read the remaining bytes
+                 * Check that all bytes have been copied: if not, return -EIO as error
+                 */
+
+                if(ret){
+                        printk(KERN_INFO "SESSION SEMANTICS->%d bytes could not be copied in session_read\n",
+                               ret);
+                        return -EIO;
+                }
+
+                printk(KERN_INFO "SESSION SEMANTICS->First bytes copied:%d\n",
+                       (PAGE_SIZE - (file_pointer % PAGE_SIZE)));
+
+                /*
+                 * Increment pointer in the user-space buffer
+                 */
+
+                buf = buf + (PAGE_SIZE - ((file_pointer % PAGE_SIZE))) * sizeof(void);
+
+                /*
+                 * Set the number of bytes left to read
+                 */
+
+                left_to_read = size - (PAGE_SIZE - ((file_pointer % PAGE_SIZE)));
+                printk(KERN_INFO "SESSION SEMANTICS->Bytes left to read:%d\n",left_to_read);
+
+                /*
+                 * Copy the content of buffer pages into the user-space buffer starting from
+                 * their base address until the remaining bytes have been read
                  */
 
                 do {
 
                         /*
-                         * Copy chunk of bytes
+                         * Bytes copied
                          */
 
-                        ret = 4095 - copy_to_user(buf, src, 4095);
+                        int copied;
 
                         /*
-                         * Update positions in the buffers:
-                         * copy_to_users returns the number
-                         * of bytes not copied
+                         * Get current page within the buffer
                          */
 
-                        buf = buf + ret * sizeof(void);
-                        src = src + ret * sizeof(void);
+                        current_page = list_entry(current_page->buffer_pages_head.next, struct buffer_page,
+                                                  buffer_pages_head);
+                        printk(KERN_INFO "SESSION SEMANTICS->Index of buffer page read now:%d\n",current_page->index);
 
                         /*
-                         * Update counter
+                         * Check that the pointer does not point to the head of list:
+                         * if this happens instead, it means it was not possible to
+                         * copy all the requested bytes from the session buffer, then
+                         * return -EIO error
                          */
 
-                        left_to_read = left_to_read - ret;
-                } while (left_to_read >= 4095);
-
-                /*
-                 * Check if the whole file was read
-                 */
-
-                if (left_to_read) {
-
-                        /*
-                         * Read remaining bytes
-                         */
-
-                        ret = copy_to_user(buf, src, left_to_read);
-
-                        /*
-                         * Set ret to the number of bytes read
-                         */
-
-                        if (!ret) {
+                        if(current_page==&session->pages){
 
                                 /*
-                                 * The whole file was read
+                                 * Release the mutex over the session object
                                  */
 
-                                ret = size;
+                                mutex_unlock(&session->mutex);
+
+                                /*
+                                 * Return the error code
+                                 */
+
+                                printk(KERN_INFO "SESSION SEMANTICS->session_read returned an error: %d\n", -EIO);
+                                return -EIO;
+
+                        }
+
+                        /*
+                         * In case the number of bytes left to read is bigger than
+                         * PAGE_SIZE, copy PAGE_SIZE bytes from the buffer page
+                         */
+
+                        if (left_to_read > PAGE_SIZE) {
+
+                                /*
+                                 * Copy a page of data
+                                 */
+
+                                printk(KERN_INFO "SESSION SEMANTICS->Bytes left to read:%d\n",left_to_read);
+                                copied = copy_to_user(buf, current_page->buffer_page_address, PAGE_SIZE);
+                                if (copied)
+                                        printk(KERN_INFO "SESSION SEMANTICS->%d bytes could not be copied  in session_read\n",
+                                               copied);
+
+                                /*
+                                 * Update positions in the user-space buffer
+                                 */
+
+                                buf = buf + (PAGE_SIZE-copied)*sizeof(void);
+
+                                /*
+                                 * Update counter of bytes left to read
+                                 */
+
+                                left_to_read = left_to_read - (PAGE_SIZE-copied);
                         }
                         else {
 
                                 /*
-                                 * Part of the file was not read
+                                 * Copy less than a page of data
+                                 */
+                                printk(KERN_INFO "SESSION SEMANTICS->Bytes left to read:%d\n",left_to_read);
+                                copied = copy_to_user(buf, current_page->buffer_page_address, left_to_read);
+                                if (copied)
+                                        printk(KERN_INFO "SESSION SEMANTICS->%d bytes could not be copied  in session_read\n",
+                                               copied);
+                                /*
+                                 * Update positions in the user-space buffer
                                  */
 
-                                ret = size - ret;
-                        }
-                }
-                else {
-                        /*
-                         * The whole file was read
-                         */
+                                buf = buf + (left_to_read-copied) * sizeof(void);
 
-                        ret = size;
-                }
+                                /*
+                                 * If last copy was successfull, "copied" is 0 and we are done
+                                 * with reading
+                                 */
+
+                                left_to_read = copied;
+                        }
+                } while (left_to_read);
         }
-        else {
+        else{
 
                 /*
-                 * Copy the requested number of bytes from the session buffer to
-                 * the user-space buffer. The function "copy_to_user" return the
-                 * number of bytes that COULD NOT BE COPIED, so we subtract this
-                 * from the requested number of bytes as result
+                 * The current page contains all requested bytes: read them
                  */
 
-                ret = size - copy_to_user(buf, src, size);
+                if(copy_to_user(buf, src, size)){
+
+                        /*
+                         * We get here if some bytes could not be copied:
+                         * return -EIO as error code
+                         */
+
+                        printk(KERN_INFO "SESSION SEMANTICS->session_read returned an error: %d\n", -EIO);
+                        return -EIO;
+
+                }
         }
+
 
         /*
          * Move the position of the file pointer in the session object
@@ -358,7 +911,7 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
          * user-space buffer
          */
 
-        session->position += (loff_t) ret;
+        session->position += (loff_t) size;
 
         /*
          * Release the mutex over the session object
@@ -370,14 +923,18 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
          * Return the number of bytes copied
          */
 
-        printk(KERN_INFO "SESSION SEMANTICS->session_read read %d bytes\n", ret);
-        return ret;
+        printk(KERN_INFO "SESSION SEMANTICS->session_read read %d bytes\n", size);
+        return size;
 }
 
 /*
  * According to the session semantics, writing a file means simply copying the content of
  * the given buffer into the buffer when the opened file is stored; also the
  * file pointer of the session has to be updated.
+ *
+ * If the the number of bytes requested for the write operation, given the current value
+ * for the file pointer, is beyond the allocated buffer, new pages have to be allocated to
+ * the buffer itself and their addresses have to be stored in the session object.
  *
  * In order to avoid race conditions among processes sharing the same struct file
  * associated to the opened file, a mutex has to be acquired first
@@ -389,8 +946,9 @@ ssize_t session_read(struct file *file, char __user *buf, size_t size, loff_t *o
  * this parameter corresponds to the file pointer used in usual I/O operations, so
  * we ignore it
  *
- * Returns number of bytes written into the buffer associated to the opened file or
- * -EINVAL in case the file does not contain a reference to the session object
+ * Returns number of bytes written into the buffer associated to the opened file,
+ * -EINVAL in case the file does not contain a reference to the session object and
+ * -EIO in case not all bytes requested can be read from session buffer
  */
 
 ssize_t session_write(struct file *file, const char __user *buf, size_t size, loff_t *offset) {
@@ -415,6 +973,19 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
         void *dest;
 
         /*
+         * Index of the page in the buffer
+         */
+
+        int index;
+
+        /*
+         * Pointer to the buffer_page structure associated to the current page
+         * within the buffer
+         */
+
+        struct buffer_page* current_page;
+
+        /*
          * Bytes left to write in the loop in case the size is larger than PAGE_SIZE
          */
 
@@ -425,13 +996,6 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
          */
 
         ssize_t ret;
-
-        /*
-         * Limit for the bytes to be written; the number of pages allocated is well
-         * defined
-         */
-
-        int limit;
 
         /*
          * Get the session object from the opened file
@@ -449,6 +1013,16 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
         }
 
         /*
+         * Check if the number of bytes to write is positive: if not, return 0
+         */
+
+        if(!size){
+                printk(KERN_INFO "WARNING: SESSION SEMANTICS->session_write: requested 0 bytes to read\n");
+                printk(KERN_INFO "SESSION SEMANTICS->session_write wrote %d bytes\n",0);
+                return 0;
+        }
+
+        /*
          * Acquire the mutex over the session object
          */
 
@@ -461,127 +1035,251 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
         file_pointer = session->position;
 
         /*
-         * Get the limit of the allocated buffer for the current session
+         * Get the index of the page in the buffer corresponding to the session file pointer
          */
 
-        limit=session->limit;
+        index=file_pointer/PAGE_SIZE;
+        printk(KERN_INFO "SESSION SEMANTICS->Index of first page to write:%d\n", index);
 
         /*
-         * Get the position within the file corresponding to the file pointer
+         * Get the page of the buffer corresponding to the file pointer
          */
 
-        dest = session->buffer + file_pointer * sizeof(void);
-
-        /*
-         * Check if the write is beyond the limit of the buffer: if so shrink
-         * the amount of bytes to write to a suitable size
-         */
-
-        if (file_pointer + size >= limit) {
-
-                size = limit - file_pointer;
+        list_for_each_entry(current_page,&session->pages,buffer_pages_head) {
+                if (current_page->index == index) {
+                        break;
+                }
         }
 
-        if(!size){
-                ret=-EINVAL;
-                printk(KERN_INFO "SESSION SEMANTICS->session_write wrote returned error %d\nReached limit of the buffer\n", ret);
-                return ret;
-        }
+        printk(KERN_INFO "SESSION SEMANTICS->Index of page corresponding to file pointer:%d\nBase address:%lu",
+               current_page->index,current_page->buffer_page_address);
 
         /*
-         * If the requested size is bigger than PAGE_SIZE, it is necessary to
-         * split the writing operations in chunks of 4095 bytes each
+         * Get the exact location within the buffer from which the requested number of bytes
+         * will be written
          */
 
-        if (size >= PAGE_SIZE) {
+        dest = current_page->buffer_page_address + (file_pointer % PAGE_SIZE) * sizeof(void);
+
+        printk(KERN_INFO "SESSION SEMANTICS->Address from which write operation starts:%lu\n", dest);
+
+        /*
+         * If the requested size is bigger than the actual size of the session buffer, new pages have
+         * to be allocated in order to satisfy the user request. Because of this, writing takes two
+         * steps:
+         *
+         * 1- expand the session buffer allocating new pages in case bytes written go beyond the limit
+         * of the session buffer
+         *
+         * 2- copy bytes from the user-space buffer to the session buffer until all the pages of the
+         * latter have been modified
+         *
+         * As regard with the second step, we adopt the same strategy used for "session_read", i.e the
+         * page of the buffer corresponding to the file pointer is filled starting from a possibly
+         * non-zero offset, and then the rest of the pages are written starting from their base address
+         */
+
+        if((file_pointer % PAGE_SIZE)+size>PAGE_SIZE) {
 
                 /*
-                 * Initially all the bytes have to write
+                 * Bytes that could not be copied
                  */
 
-                left_to_write = size;
+                int failed;
 
                 /*
-                 * With the following loop we read a number
-                 * of bytes that is multiple of 4095.
-                 * Then we read the remaining bytes
+                 * Return value from function to expand the session buffer
+                 */
+
+                int expand_buffer;
+
+                /*
+                 * Copy first bytes
+                 */
+
+                failed=copy_from_user(dest, buf, PAGE_SIZE - ((file_pointer % PAGE_SIZE)));
+
+                /*
+                 * Check that all bytes could be copied: if not, return -EIO error
+                 */
+
+                if(failed){
+                        printk(KERN_INFO "SESSION SEMANTICS->%d bytes could not be copied in session_write\n",
+                               ret);
+                        return -EIO;
+                }
+
+                /*
+                 * Copy was successful
+                 */
+
+                printk(KERN_INFO "SESSION SEMANTICS->Number of bytes written to fill the page:%d\n",
+                       PAGE_SIZE - ((file_pointer % PAGE_SIZE)));
+
+                /*
+                 * Increment pointer in the user-space buffer
+                 */
+
+                buf = buf + (PAGE_SIZE - ((file_pointer % PAGE_SIZE))) * sizeof(void);
+
+                /*
+                 * Set the number of bytes left to write
+                 */
+
+                left_to_write = size - (PAGE_SIZE - ((file_pointer % PAGE_SIZE)));
+
+                /*
+                 * We filled the page containing the file pointer with first bytes
+                 * from the user-space buffer => increment the index variable
+                 */
+
+                ++index;
+
+                /*
+                 * If the left bytes go beyond the actual boundary of the file, expand
+                 * the buffer with a proper number of pages before start copying data
+                 * from user-space to session buffer
+                 */
+
+                if(left_to_write/PAGE_SIZE+1>session->nr_pages-index) {
+
+                        /*
+                         * Expand the buffer
+                         */
+
+                        expand_buffer = session_expand_buffer(session, left_to_write);
+
+                        /*
+                         * Check the return value: if positive, the buffer has been expanded
+                         * successfully and we update the number of pages in the buffer, while
+                         * if it's negative something went wrong so we stop and return error
+                         * code
+                         */
+
+                        if(expand_buffer>=0)
+                                session->nr_pages+=expand_buffer;
+                        else {
+                                printk(KERN_INFO "SESSION SEMANTICS->Could not expand the buffer because of error:%d\n",expand_buffer);
+                                mutex_unlock(&session->mutex);
+                                return expand_buffer;
+                        }
+                        printk(KERN_INFO "SESSION SEMANTICS->Expanded buffer: now there are %d pages\n",session->nr_pages);
+                }
+
+                /*
+                 * Copy the content of buffer pages into the user-space buffer starting from
+                 * their base address until the remaining bytes have been read
                  */
 
                 do {
-                        /*
-                         * Copy chunk of bytes
-                         */
-
-                        ret = 4095 - copy_from_user(dest, buf, 4095);
 
                         /*
-                         * Update positions in the buffers:
-                         * copy_to_users returns the number
-                         * of bytes not copied
+                         * Bytes copied
                          */
 
-                        dest = dest + ret * sizeof(void);
-                        buf = buf + ret * sizeof(void);
+                        int copied;
 
                         /*
-                         * Update counter
+                         * Get current page within the buffer
                          */
 
-                        left_to_write = left_to_write - ret;
-                } while (left_to_write >= 4095);
-
-                /*
-                 * Check if the whole file was written
-                 */
-
-                if (left_to_write) {
+                        current_page = list_entry(current_page->buffer_pages_head.next, struct buffer_page,
+                                                  buffer_pages_head);
+                        printk(KERN_INFO "SESSION SEMANTICS->Index of current page to write:%d\n", current_page->index);
 
                         /*
-                         * Read remaining bytes
+                         * Check that the pointer does not point to the head of list:
+                         * if this happens instead, it means that we need more pages
+                         * for the session buffer because the size of bytes to be
+                         * written goes beyond the limit of the session buffer.
+                         *
+                         * If this is the case, it means that some pages could not be
+                         * copied from the user-space buffer in previous iteration
+                         * => return -EIO error code
                          */
 
-                        ret = copy_from_user(dest, buf, left_to_write);
+                        if(current_page==&session->pages){
+                                printk(KERN_INFO "SESSION SEMANTICS->Some bytes could not be copied in session_write\n");
+                                return -EIO;
+                        }
 
                         /*
-                         * Set ret to the number of bytes written
+                         * In case the number of bytes left to write is bigger than
+                         * PAGE_SIZE, copy PAGE_SIZE bytes into the buffer page
                          */
 
-                        if (!ret) {
+                        printk(KERN_INFO "SESSION SEMANTICS->Bytes left to write:%d\n", left_to_write);
+                        if (left_to_write > PAGE_SIZE) {
 
                                 /*
-                                 * The whole file was written
+                                 * Copy a page of data
                                  */
 
-                                ret = size;
+                                copied = copy_from_user(current_page->buffer_page_address,buf, PAGE_SIZE);
+
+                                /*
+                                 * Update positions in the user-space buffer
+                                 */
+
+                                buf = buf + (PAGE_SIZE-copied) * sizeof(void);
+
+                                /*
+                                 * Update counter of bytes left to write
+                                 */
+
+                                left_to_write = left_to_write - (PAGE_SIZE-copied);
                         }
                         else {
 
                                 /*
-                                 * Part of the file was not written
+                                 * Copy less than a page of data
                                  */
 
-                                ret = size - ret;
+                                copied = copy_from_user(current_page->buffer_page_address,buf,left_to_write);
+
+                                /*
+                                 * Update positions in the user-space buffer
+                                 */
+
+                                buf = buf + (left_to_write-copied) * sizeof(void);
+
+                                /*
+                                 * If all bytes were successfully written, "copied" is
+                                 * equal to 0, so we exit the loop
+                                 */
+
+                                left_to_write = copied;
                         }
-                }
-                else {
-
-                        /*
-                         * The whole file was written
-                         */
-
-                        ret = size;
-                }
-        }
-        else {
+                } while (left_to_write);
 
                 /*
-                 * Copy the requested number of bytes from the user-space buffer to
-                 * the session buffer. The function "copy_from_user" return the
-                 * number of bytes that COULD NOT BE COPIED, so we subtract this
-                 * from the requested number of bytes as result
+                 * After expanding the session buffer, all requested bytes have been copied from
+                 * user-space buffer into session buffer
+                 */
+        }
+        else{
+
+                /*
+                 * The current page suffices to copy all requested bytes
                  */
 
-                ret = size - copy_from_user(dest, buf, size);
+                ret=copy_from_user(dest, buf, size);
+
+                /*
+                 * Check if all bytes could be copied into session buffer: if not,
+                 * return -EIO error
+                 */
+
+                if(ret){
+
+                        /*
+                         * We get here if some bytes could not be copied:
+                         * return -EIO
+                         */
+
+                        printk(KERN_INFO "SESSION SEMANTICS->Some bytes could not be copied in session_write\n");
+                        return -EIO;
+                }
         }
 
         /*
@@ -590,18 +1288,19 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
          * session buffer
          */
 
-        session->position+=(loff_t)ret;
+        session->position+=(loff_t)size;
 
         /*
          * If the file pointer now points to an offset greater or equal than
          * the offset stored in the "filesize" field (recall that offset of
          * file starts from zero, so if file pointer is equal to filesize it
-         * means the file changed its size
-         * so we have to update the "filesize" field
+         * means the file changed its size so we have to update the "filesize"
+         * field
          */
 
         if (session->position > session->filesize){
-                session->filesize = session->position;
+                session->filesize += (session->position-session->filesize);
+                printk(KERN_INFO "SESSION SEMANTICS->session_write increased filesize to:%d\n",session->filesize);
         }
 
         /*
@@ -622,7 +1321,8 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
          * Return the number of bytes copied
          */
 
-        return ret;
+        printk(KERN_INFO "SESSION SEMANTICS->session_write wrote %d bytes\n",size);
+        return size;
 }
 
 /*
@@ -637,6 +1337,9 @@ ssize_t session_write(struct file *file, const char __user *buf, size_t size, lo
  * @offset: the size of the shift of the file pointer
  * @origin: position within the session buffer from which the shift has to take place;
  * values for this parameter have to be interpreted as with regular lseek, namely
+ *
+ * NOTE: FILE HOLES ARE NOT ALLOWED -> it is possible to set the session file pointer only
+ * within the boundaries of actual size of the file
  *
  * SEEK_SET: origin coincides with the beginning of the buffer
  * SEEK_CUR: origin coincides with the current values of the session file pointer
@@ -669,6 +1372,12 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
         void *dest;
 
         /*
+         * Index of the page in the buffer
+         */
+
+        int index;
+
+        /*
          * Get the session object from the opened file
          */
 
@@ -696,12 +1405,21 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
         file_pointer = session->position;
 
         /*
+         * Get the index of the page in the buffer corresponding to the session file pointer
+         */
+
+        index=file_pointer/PAGE_SIZE;
+
+        /*
          * Set the new value for the file pointer depending on the provided flag for
          * the "origin" parameter
          */
-
+        printk(KERN_INFO "SESSION SEMANTICS->Current position of session file pointer:%d\n",session->position);
+        printk(KERN_INFO "SESSION SEMANTICS->Current filesize:%d\n",session->filesize);
         switch (origin) {
                 case SEEK_END: {
+
+                        printk(KERN_INFO "SESSION SEMANTICS->Seeking session from first byte after end of buffer\n");
 
                         /*
                          * Return -EINVAL if the new requested position for the file pointer is beyond the actual
@@ -723,12 +1441,14 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
                 }
                 case SEEK_CUR: {
 
+                        printk(KERN_INFO "SESSION SEMANTICS->Seeking session from current position in the buffer\n");
+
                         /*
                          * Return -EINVAL if the new requested position for the file pointer is beyond the actual
                          * limits of the opened file; also release mutex on session object
                          */
 
-                        if ((file_pointer + offset >= session->filesize) || (file_pointer + offset < 0)) {
+                        if ((file_pointer + offset > session->filesize) || (file_pointer + offset < 0)) {
                                 printk(KERN_INFO "SESSION SEMANTICS->session_llseek returned an error: %d\n", -EINVAL);
                                 mutex_unlock(&session->mutex);
                                 return -EINVAL;
@@ -739,17 +1459,17 @@ loff_t session_llseek(struct file *file, loff_t offset, int origin) {
                          */
 
                         session->position += offset;
-                        printk(KERN_INFO "lseek:%d char:%c\n",session->position,((char*)(session->buffer))[session->position]);
                         break;
                 }
                 case SEEK_SET: {
+
+                        printk(KERN_INFO "SESSION SEMANTICS->Seeking session from first byte of buffer\n");
 
                         /*
                          * Return -EINVAL if the new requested position for the file pointer is beyond the actual
                          * limits of the opened file; also release mutex on session object
                          */
 
-                        printk("filesize:%d\n",session->filesize);
                         if ((offset < 0) || (offset >= session->filesize)) {
                                 printk(KERN_INFO "SESSION SEMANTICS->session_llseek returned an error: %d\n", -EINVAL);
                                 mutex_unlock(&session->mutex);
@@ -878,6 +1598,18 @@ int session_close(struct file *file, fl_owner_t id) {
         if (session->dirty) {
 
                 /*
+                 * Next page from the buffer to be flushed into the original file
+                 */
+
+                struct buffer_page* current_page;
+
+                /*
+                 * Index used to iterate through pages of the session buffer
+                 */
+
+                int i;
+
+                /*
                  * Current file pointer in the session buffer
                  */
 
@@ -909,17 +1641,22 @@ int session_close(struct file *file, fl_owner_t id) {
                  * Truncate file to zero length before flushing the content
                  */
 
+                printk(KERN_INFO "SESSION SEMANTICS->session_close will now truncate file %s\n",session->filename);
                 ret = truncate_call(session->filename, 0);
 
                 /*
                  * Return error code if truncate fails; before the
-                 * session has to be unlocked
+                 * session has to be removed, the module usage
+                 * counter has to be decreased and the original
+                 * memory segment has to be set
                  */
 
-                if(!ret) {
+                if(ret) {
                         set_fs(segment);
-                        mutex_unlock(&session->mutex);
-                        printk(KERN_INFO "SESSION SEMANTICS->session_close returned error: %d\n", ret);
+                        session_remove(session);
+                        module_put(THIS_MODULE);
+                        printk(KERN_INFO "SESSION SEMANTICS->session_close could not truncate file and returned error: %d\n", ret);
+                        return ret;
                 }
 
                 /*
@@ -927,32 +1664,184 @@ int session_close(struct file *file, fl_owner_t id) {
                  * object and the struct file of the opened file
                  */
 
-                buffer = session->buffer;
                 filesize = session->filesize;
                 off = file->f_pos;
 
                 /*
-                 * Write content to the file using the original write operation
-                 * of the opened file: the number of written values is returned.
-                 * First the memory segment has to be set.
+                 * Initialize "current_page" to the first element of the list of
+                 * pages of the session
+                 */
+
+                current_page=list_entry(session->pages.next,struct buffer_page,buffer_pages_head);
+                printk(KERN_INFO "SESSION SEMANTICS->session_close will now flush buffer page %d with base address %lu\nOffset:%lld",current_page->index,current_page->buffer_page_address,off);
+
+                /*
+                 * Set appropriate memory segment.
                  */
 
                 set_fs(KERNEL_DS);
-                ret = session->f_ops_old->write(file, buffer, filesize, &off);
+
+                /*
+                 * Do differentiated work depending on the number of pages in the
+                 * buffer
+                 */
+
+                printk(KERN_INFO "SESSION SEMANTICS->Number of pages:%d\n",session->nr_pages);
+                if(session->nr_pages>1) {
+
+                        /*
+                         * Write first page of the buffer; note that file pointer of the original
+                         * file gets updated so that next write will occur after last written byte
+                         */
+
+                        ret = session->f_ops_old->write(file, current_page->buffer_page_address, PAGE_SIZE,
+                                                       &off);
+
+                        /*
+                         * If the number of bytes flushed to the original file is less
+                         * than the size of the buffer, return -EIO (I/O error); first
+                         * release the session, decrement the module usage counter and
+                         * restore previous memory segment
+                         */
+
+                        if (ret < PAGE_SIZE) {
+                                ret = -EIO;
+                                set_fs(segment);
+                                session_remove(session);
+                                module_put(THIS_MODULE);
+                                printk(KERN_INFO "SESSION SEMANTICS->session_close could not write all bytes because of error: %d\n", ret);
+                                return ret;
+                        }
+
+                        /*
+                         * Decrease filesize
+                         */
+
+                        filesize-=PAGE_SIZE;
+
+                        /*
+                         * Flush content of every remaining single page of the buffer into the original
+                         * file
+                         *
+                         * In the following loop we write PAGE_SIZE bytes
+                         */
+
+                        for (i = 0; i < session->nr_pages-2; i++) {
+
+                                /*
+                                 * Get current page within the buffer
+                                 */
+
+                                current_page = list_entry(current_page->buffer_pages_head.next, struct buffer_page,
+                                                          buffer_pages_head);
+                                printk(KERN_INFO "SESSION SEMANTICS->session_close will now flush buffer page %d\nOffset:%lld\n",current_page->index,off);
+
+                                /*
+                                 * Write content of the page into the file
+                                 */
+
+                                ret = session->f_ops_old->write(file, current_page->buffer_page_address, PAGE_SIZE,
+                                                                &off);
+
+                                /*
+                                 * If the number of bytes flushed to the original file is less
+                                 * than the size of the buffer, return -EIO (I/O error)
+                                 */
+
+                                if (ret < PAGE_SIZE) {
+                                        ret = -EIO;
+                                        set_fs(segment);
+                                        session_remove(session);
+                                        module_put(THIS_MODULE);
+                                        printk(KERN_INFO "SESSION SEMANTICS->session_close could not write all bytes because of error: %d\n", ret);
+                                        return ret;
+                                }
+
+                                /*
+                                 * Decrease filesize
+                                 */
+
+                                filesize-=PAGE_SIZE;
+
+                        }
+
+                        printk(KERN_INFO "SESSION SEMANTICS->session_close will now flush remaning bytes:%d",filesize);
+
+                        /*
+                         * Now we write last bytes (possibly less than PAGE_SIZE) into file
+                         */
+
+                        current_page = list_entry(current_page->buffer_pages_head.next, struct buffer_page,
+                                                  buffer_pages_head);
+                        printk(KERN_INFO "SESSION SEMANTICS->session_close will now flush buffer page %d\nBytes to copy:%d\nOffset:%lld",current_page->index,filesize%PAGE_SIZE,off);
+
+                        /*
+                         * Copy remaining bytes
+                         */
+
+                        if(filesize%PAGE_SIZE) {
+                                ret = session->f_ops_old->write(file, current_page->buffer_page_address,
+                                                                filesize % PAGE_SIZE, &off);
+
+                                /*
+                                 * Check that all bytes were written
+                                 */
+
+                                if (ret < filesize%PAGE_SIZE) {
+                                        ret = -EIO;
+                                        set_fs(segment);
+                                        session_remove(session);
+                                        module_put(THIS_MODULE);
+                                        printk(KERN_INFO "SESSION SEMANTICS->session_close could not write all bytes because of error: %d\n", ret);
+                                        return ret;
+                                }
+                        }
+                        else {
+                                ret = session->f_ops_old->write(file, current_page->buffer_page_address, PAGE_SIZE,
+                                                                &off);
+
+                                /*
+                                 * Check that all bytes were written
+                                 */
+
+                                if (ret < PAGE_SIZE) {
+                                        ret = -EIO;
+                                        set_fs(segment);
+                                        session_remove(session);
+                                        module_put(THIS_MODULE);
+                                        printk(KERN_INFO "SESSION SEMANTICS->session_close could not write all bytes because of error: %d\n", ret);
+                                        return ret;
+                                }
+                        }
+                }
+                else {
+
+                        /*
+                         * Copy content of the only page
+                         */
+
+                        ret = session->f_ops_old->write(file, current_page->buffer_page_address, filesize % PAGE_SIZE,
+                                                        &off);
+
+                        /*
+                         * Check that all bytes were written
+                         */
+
+                        if (ret < filesize%PAGE_SIZE) {
+                                ret = -EIO;
+                                set_fs(segment);
+                                session_remove(session);
+                                module_put(THIS_MODULE);
+                                printk(KERN_INFO "SESSION SEMANTICS->session_close could not write all bytes because of error: %d\n", ret);
+                                return ret;
+                        }
+                }
 
                 /*
                  * Restore memory segment
                  */
 
                 set_fs(segment);
-
-                /*
-                 * If the number of bytes flushed to the original file is less
-                 * than the size of the buffer, return -EIO (I/O error)
-                 */
-
-                if (ret < session->filesize)
-                        ret = -EIO;
         }
 
         /*
@@ -968,11 +1857,18 @@ int session_close(struct file *file, fl_owner_t id) {
         session_remove(session);
 
         /*
+         * Before returning decrement the module usage counter
+         */
+
+        printk(KERN_INFO "SESSION SEMANTICS->Decrementing module usage counter\n");
+        module_put(THIS_MODULE);
+
+        /*
          * Return outcome of the function
          */
 
-        printk(KERN_INFO "SESSION SEMANTICS->session_close returned value: %d\n", ret);
-        return ret;
+        printk(KERN_INFO "SESSION SEMANTICS->session_close returned value: %d\n", 0);
+        return 0;
 }
 
 /*
@@ -982,35 +1878,37 @@ int session_close(struct file *file, fl_owner_t id) {
 /*
  * SESSION INIT - start
  *
- * Set the buffer used by the session to the pages filled with the content of the
+ * Set the initial buffer used by the session to the pages filled with the content of the
  * file and initialize its mutex semaphore
  *
  * @session: session object to be initialized
- * @buffer: virtual address of the contiguous address space to be used as buffer
- * of the session
- * @filename: user-space filename of the opened file
- * @order; number of pages allocated to the buffer
+ * @va: virtual address of the contiguous address space to be used as initial buffer of
+ * the session
+ * @filename: kernel-space filename of the opened file
+ * @order: 2^order pages have been allocated to the inital buffer
+ * @firstpage: pointer to the descriptor of the first among the frames allocated as initial
+ * buffer
+ * @filesize: number of bytes in the opened file
+ *
+ * Returns 0 in case of success, -ENOMEM if not enough memory is available for the
+ * creation of the new objects and -EINVAL if any of the given pointer is NULL
  */
 
-void session_init(struct session *session, void *buffer, const char __user *filename, int order) {
+int session_init(struct session *session, void *va, const char *filename, int order,struct page* firstpage,loff_t filesize) {
 
         /*
-         * Length of the string representing the filename
+         * Index value used in the pages loop (see below)
          */
 
-        int length;
+        int i;
+
+        printk(KERN_INFO "SESSION SEMANTICS->Initialising session\n");
 
         /*
          * Initialize the mutex
          */
 
         mutex_init(&session->mutex);
-
-        /*
-         * Set the buffer
-         */
-
-        session->buffer = buffer;
 
         /*
          * Set the file pointer to 0
@@ -1025,42 +1923,77 @@ void session_init(struct session *session, void *buffer, const char __user *file
         session->dirty = false;
 
         /*
-         * Get the length of the string representing the filename
+         * Set the file length in the session object
          */
 
-        length=strlen(filename);
-
-        /*
-         * Dynamically allocate a string to store the filename
-         */
-
-        session->filename=kmalloc(length,GFP_KERNEL);
+        session->filesize = filesize;
 
         /*
          * Store the filename into the session
          */
 
-        copy_from_user(session->filename,filename,length);
+        session->filename=filename;
 
         /*
-         * Set the limit of the offset
+         * Store the number of pages in the initial buffer
          */
 
-        session->limit = (1 << order) * PAGE_SIZE;
-
-        /*
-         * Store the order
-         */
-
-        session->order = order;
+        session->nr_pages = (1 << order);
 
         /*
          * Initialize the link to the list of sessions
          */
 
         INIT_LIST_HEAD(&(session->link_to_list));
-}
 
+        /*
+         * Initialize the the list of pages
+         */
+
+        INIT_LIST_HEAD(&(session->pages));
+
+        /*
+         * Store address of the descriptor and virtual address of the pages allocated
+         * for the initial buffer into the session object
+         */
+
+        for(i=0;i<session->nr_pages;i++){
+
+                /*
+                 * Pointer to the new buffer_page object
+                 */
+
+                struct buffer_page* buffer_page;
+
+                /*
+                 * Create a new "buffer_page" object for each page of the buffer
+                 */
+
+                buffer_page=session_new_buffer_page(va+i*PAGE_SIZE,firstpage+i,i);
+
+                /*
+                 * Check if the creation of the new object was successful: if not,
+                 * return the associated error code
+                 */
+
+                if(IS_ERR_VALUE(PTR_ERR(buffer_page)))
+                        return PTR_ERR(buffer_page);
+                /*
+                 * Add the newly created object to the corresponding list in the session
+                 * object
+                 */
+
+                printk(KERN_INFO "SESSION SEMANTICS->Adding buffer page %lu to session\n",buffer_page);
+                list_add_tail(&buffer_page->buffer_pages_head,&(session->pages));
+        }
+
+        /*
+         * Initialization of the session object was successful: return 0
+         */
+
+        printk(KERN_INFO "SESSION SEMANTICS->Session for file \"%s\" successfully initialised\n",session->filename);
+        return 0;
+}
 
 /*
  * SESSION INIT - end
@@ -1222,8 +2155,8 @@ int session_install(struct file *file, struct session *session) {
 }
 
 /*
-* SESSION INSTALL - end
-*/
+ * SESSION INSTALL - end
+ */
 
 /*
  * CLEANUP MODULE FOR SESSION SEMANTICS - start
@@ -1272,6 +2205,302 @@ void sessions_remove(void) {
  */
 
 /*
+ * SESSION OPEN - start
+ *
+ * Do all the work associated to the opening of a session.
+ *
+ * After the file has been opened using the original system call "open", the
+ * content of the opened file is copied into some new pages dynamically allocated
+ * bypassing the BUFFER CACHE.
+ *
+ * In this way the current process has its own copy of the file and can freely
+ * modify it in such a way that modifications are not visible to other processes
+ * that use the same file concurrently.
+ *
+ * @fd: file descriptor of the opened file
+ * @filename: name of the file to be opened
+ * @flags: flags to be used to determine the semantic of the file
+ * @mode: permissions of the current process w.r.t. the opened file (mandatory if
+ * O_CREAT flag is given)
+ *
+ * Returns 0 in case everything works, a negative error code otherwise
+ */
+
+int session_open(int fd,const char __user *filename, int flags, int mode){
+
+        /*
+         * Kernel representation of filename
+         */
+
+        const char* kernel_filename;
+
+        /*
+         * Return value
+         */
+
+        int ret;
+
+        /*
+         * Pointer to the descriptor of the first page in the buffer allocated to
+         * read the file
+         */
+
+        struct page *first_page;
+
+        /*
+         * File object of the opened file
+         */
+
+        struct file *opened_file;
+
+        /*
+         * Pointer to object used to manage the operations on a file opened
+         * using a session semantics
+         */
+
+        struct session *session;
+
+        /*
+         * Virtual address of the buffer into which the file is stored while
+         * a session is open
+         */
+
+        void *va;
+
+        /*
+         * Order of pages to be requested to the function "alloc_pages" in order
+         * to store the content of the opened file
+         */
+
+        int order;
+
+        /*
+         * Size of the file to be opened
+         */
+
+        loff_t filesize;
+
+        /*
+         * Get the file object corresponding to the opened file
+         */
+
+        opened_file = get_file_from_descriptor(fd);
+
+        /*
+         * Get the size of the opened file
+         */
+
+        filesize = opened_file->f_dentry->d_inode->i_size;
+
+        /*
+         * ALLOCATE SESSION BUFFER
+         *
+         * Allocate the initial buffer associated to the current session
+         *
+         * The size is such that the whole file can be copied into it: 2^order
+         * pages are allocated; if the file is empty, only one pages is allocated
+         *
+         * The pointer to the descriptor of the first page in the buffer is returned
+         * and the order variable is set
+         */
+
+        first_page=session_create_buffer(filesize,filename,&order);
+
+        /* Check that the pages have been successfully allocated:
+         * return -ENOMEM in case not enough memory is available
+         * for them
+         */
+
+        if (!first_page) {
+                ret = -ENOMEM;
+                printk(KERN_INFO "System call sys_session_open returned this error value:%d\n", ret);
+                return ret;
+        }
+
+        /*
+         * Map pages of the buffer into virtual address space
+         */
+
+        va = kmap(first_page);
+
+        /*
+         * Allocate a new session object
+         */
+
+        session = kmalloc(sizeof(struct session), GFP_KERNEL);
+
+        /*
+         * Check that the session object has  been successfully
+         * allocated: return -ENOMEM in case not enough memory
+         * is available and release allocated pages
+         */
+
+        if (!session) {
+                ret = -ENOMEM;
+                __free_pages(first_page, order);
+                printk(KERN_INFO "System call sys_session_open returned this error value:%d\n", ret);
+                return ret;
+        }
+
+        /*
+         * INITIALIZE SESSION OBJECT - start
+         *
+         * First copy dynamically allocate a string to store the filename
+         * into session; a string has a termination '\0' character which
+         * is not counted by "strlen" function
+         */
+
+        kernel_filename=kmalloc(strlen(filename)+1,GFP_KERNEL);
+
+        /*
+         * Check enough memory is available: if not, release the session
+         * object,release allocated pages and return -ENOMEM
+         */
+
+        if(!kernel_filename){
+                ret = -ENOMEM;
+                __free_pages(first_page, order);
+                kfree(session);
+                printk(KERN_INFO "System call sys_session_open returned this error value:%d\n", ret);
+                return ret;
+        }
+
+        /*
+         * Copy filename from user-space into kernel-space
+         */
+
+        copy_from_user(kernel_filename,filename,strlen(filename)+1);
+
+        /*
+         * Initialise the session object
+         */
+
+        ret=session_init(session, va, kernel_filename, order,first_page,filesize);
+
+        /*
+         * Check if the initialization of the session object: if not, free
+         * allocated memory and return the error code
+         */
+
+        if(ret){
+                struct buffer_page* buffer_page;
+                struct buffer_page* temp;
+                list_for_each_entry_safe(buffer_page,temp,&session->pages,buffer_pages_head){
+                        kfree(buffer_page);
+                }
+                __free_pages(first_page, order);
+                kfree(session);
+                kfree(kernel_filename);
+                printk(KERN_INFO "System call sys_session_open returned this error value:%d\n", ret);
+                return ret;
+        }
+
+        /*
+         * Save private data of the opened file (if any)
+         */
+
+        if(opened_file->private_data) {
+                session->private=opened_file->private_data;
+        }
+
+        /*
+         * INITIALIZE SESSION OBJECT - end
+         */
+
+        /*
+         * If the file is not empty, copy its content into the allocated
+         * session buffer
+         */
+
+        if(filesize) {
+
+                /*
+                 * COPY FILE INTO SESSION BUFFER - start
+                 */
+
+                /*
+                 * Copy the content of the opened file into the session buffer, page by page,
+                 * until a number of bytes equal to the filesize has been transferred
+                 */
+
+                ret=session_fill_buffer(first_page,order,opened_file);
+
+                /*
+                 * The function returns 0 when the request is successfully submitted:
+                 * if this it not the case, we return the error code -EIO (I/O error)
+                 * and release the allocated memory, although this should be unlikely
+                 */
+
+                if (ret) {
+                        struct buffer_page* buffer_page;
+                        struct buffer_page* temp;
+                        list_for_each_entry_safe(buffer_page,temp,&session->pages,buffer_pages_head){
+                                kfree(buffer_page);
+                        }
+                        __free_pages(first_page, order);
+                        kfree(session);
+                        kfree(kernel_filename);
+                        ret = -EIO;
+                        printk(KERN_INFO "System call sys_session_open returned this error value:%d\n", ret);
+                        return ret;
+                }
+
+                /*
+                 * COPY FILE INTO SESSION BUFFER - end
+                 */
+        }
+
+        /*
+         * Install the session in the opened file
+         */
+
+        ret=session_install(opened_file, session);
+
+        /*
+         * Check if the session has been properly installed:
+         * if not, return corresponding error code and free
+         * allocated memory
+         */
+
+        if(ret) {
+                struct buffer_page *buffer_page;
+                struct buffer_page *temp;
+                list_for_each_entry_safe(buffer_page, temp, &session->pages, buffer_pages_head) {
+                        kfree(buffer_page);
+                }
+                __free_pages(first_page, order);
+                kfree(session);
+                kfree(kernel_filename);
+                ret = -EIO;
+                printk(KERN_INFO "System call sys_session_open returned this value:%d\n", ret);
+                return ret;
+        }
+
+        /*
+         * Before returning, increment the usage counter of this module, so
+         * it won't be possible to remove it while there's an ongoing I/O
+         * session. The counter will be decremented when the session is
+         * explicitly closed
+         */
+
+        printk(KERN_INFO "SESSION SEMANTICS->Incrementing module usage counter\n");
+        try_module_get(THIS_MODULE);
+
+        /*
+         * The session has been successfully opened: print file descriptor
+         * of the file that is now opened adopting the session semantics
+         * and return 0
+         */
+
+        printk(KERN_INFO "System call sys_session_open returned this value:%d\n", fd);
+        return 0;
+}
+
+/*
+ * SESSION OPEN - end
+ */
+
+/*
  * SYS_OPEN WITH SESSION SEMANTICS SUPPORT
  *
  * This is the system call we replace the tradition "open" system call with
@@ -1308,19 +2537,13 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
         int fd;
 
         /*
-         * Return value
-         */
-
-        int ret;
-
-        /*
          * Open file using the original sys_open system call ignoring the flag
          * used to request the session semantics (for the time being)
          */
 
         if (flags & SESSION_OPEN) {
                 fd = previous_open(filename, flags & ~SESSION_OPEN, mode);
-                printk(KERN_INFO "SESSION SEMANTICS:Flags for filename \"%s\": %d; file descriptor:%d\n", filename,
+                printk(KERN_INFO "SESSION SEMANTICS->Flags for filename \"%s\": %d; file descriptor:%d\n", filename,
                        flags & ~SESSION_OPEN, fd);
         }
         else {
@@ -1335,346 +2558,27 @@ asmlinkage long sys_session_open(const char __user *filename, int flags, int mod
         if (flags & SESSION_OPEN && fd > 0) {
 
                 /*
-                 * Pointer to the descriptor of the first page in the buffer allocated to
-                 * read the file
+                 * Return value
                  */
 
-                struct page *first_page;
+                int ret;
 
                 /*
-                 * This structure contains pointers to the functions used by the VFS layer
-                 * in order to ask the I/O block layer to trasnfer data to and from devices
+                 * Open session
                  */
 
-                struct address_space *mapping;
+                ret=session_open(fd,filename,flags,mode);
 
                 /*
-                 * Pointer to the structure designed to handle opened files of a process
-                 */
-
-                struct files_struct *files;
-
-                /*
-                 * File descriptors table of the current process
-                 */
-
-                struct fdtable *table;
-
-                /*
-                 * File object of the opened file
-                 */
-
-                struct file *opened_file;
-
-                /*
-                 * Pointer to the page descriptor of the allocated pages; this is
-                 * used in the iteration to initialize the session buffer
-                 */
-
-                struct page *page;
-
-                /*
-                 * Pointer to object used to manage the operations on a file opened
-                 * using a session semantics
-                 */
-
-                struct session *session;
-
-                /*
-                 * Virtual address of the buffer into which the file is stored while
-                 * a session is open
-                 */
-
-                void *va;
-
-                /*
-                 * Order of pages to be requested to the function "alloc_pages" in order
-                 * to store the content of the opened file
-                 */
-
-                int order;
-
-                /*
-                 * Index used to iterate through allocated pages
-                 */
-
-                int i;
-
-                /*
-                 * Size of the file to be opened in bytes;
-                 */
-
-                loff_t filesize;
-
-                /*
-                 * Get the open file table of the current process
-                 */
-
-                files = current->files;
-
-                /*
-                 * Get the table of file descriptors
-                 */
-
-                table = files_fdtable(files);
-
-                /*
-                 * Get the file object corresponding to the opened file
-                 */
-
-                opened_file = table->fd[fd];
-
-                /*
-                 * Get the size of the opened file
-                 */
-
-                filesize = opened_file->f_dentry->d_inode->i_size;
-
-                /*
-                 * Check the size of the file: if it's bigger than zero, its content is copied
-                 * into a buffer of dynamically allocated pages and then the session object is
-                 * created; if it's zero, only the session object is created
-                 */
-
-                if (!filesize) {
-
-                        /*
-                         * File is empty, allocate only four pages in case new content has
-                         * to be added; order is 2
-                         */
-
-                        printk(KERN_INFO "SESSION SEMANTICS-> File \"%s\" has size 0\n",filename);
-                        first_page = alloc_pages(GFP_KERNEL, 2);
-                        order=0;
-                }
-                else{
-
-                        /*
-                         * File is not empty, so allocate as many pages as
-                         * necessary to store the file
-                         */
-
-                        /*
-                         * Get the order of pages to be allocated using alloc_pages
-                         */
-
-                        order = get_order(filesize);
-
-                        /*
-                         * Get 2^order free pages to store the content of the opened file
-                         * and add an equal number of pages in case new content has to be
-                         * added
-                         */
-
-                        first_page = alloc_pages(GFP_KERNEL, order+1);
-                }
-
-                /*
-                 * Check that the pages have been successfully allocated:
-                 * return -ENOMEM in case not enough memory is available
-                 * for them
-                 */
-
-                if (!first_page) {
-                        ret = -ENOMEM;
-                        printk(KERN_INFO "System call sys_session_open returned this value:%d\n", ret);
-                        return ret;
-                }
-
-                /*
-                 * Pages are mapped in the virtual address space one after the other
-                 * so we only need the virtual address of the first page
-                 */
-
-                va = kmap(first_page);
-
-                /*
-                 * Allocate a new session object
-                 */
-
-                session = kmalloc(sizeof(struct session), GFP_KERNEL);
-
-                /*
-                 * Check that the session object has  been successfully
-                 * allocated: return -ENOMEM in case not enough memory
-                 * is available
-                 */
-
-                if (!session) {
-                        ret = -ENOMEM;
-                        printk(KERN_INFO "System call sys_session_open returned this value:%d\n", ret);
-                        return ret;
-                }
-
-                /*
-                 * Initialize the session object
-                 */
-
-                session_init(session, va, filename, order);
-
-                /*
-                 * Store the address of the page descriptor of the first page in the buffer:
-                 * this will be used when the session has to be removed
-                 */
-
-                session->pages = first_page;
-
-                /*
-                 * Set the file length in the session object
-                 */
-
-                session->filesize = filesize;
-
-                /*
-                 * Get the address_space structure of the opened file
-                 */
-
-                mapping = opened_file->f_mapping;
-
-                /*
-                 * Save private data of the opened file (if any)
-                 */
-
-                if(opened_file->private_data) {
-                        session->private=opened_file->private_data;
-                }
-
-                /*
-                 * If the file is not empty, copy it content into the allocated
-                 * session buffer
-                 */
-
-                if(!filesize) {
-
-                        /*
-                         * SET THE BUFFER FOR THIS SESSION - start
-                         *
-                         * Copy the content of the opened file into the session buffer, page by page,
-                         * until a number of bytes equal to the filesize has been transferred. At each
-                         * the function "readpage", from the address_space of the file, is used to
-                         * transfer data from the device where the file is stored to the page frame
-                         */
-
-                        page = first_page;
-                        for (i = 0; i < (1 << order); i++) {
-
-                                /*
-                                 * Lock the page before accessing it
-                                 */
-
-                                __set_page_locked(page);
-
-                                /*
-                                 * Initialize the address_space structure of the new
-                                 * page to the one of the opened file; also set its
-                                 * index field, which represents the offset of the page
-                                 * with respect to the beginning of the file (in terms
-                                 * of pages)
-                                 */
-
-                                page->mapping = mapping;
-                                page->index = i;
-
-                                /*
-                                 * Copy the content of the file to the newly allocated pages
-                                 * using the readpage: this is a low-level function which wraps
-                                 * the function provided by the filesystem to read the content
-                                 * of its files into memory
-                                 *
-                                 * This function creates an instance of the "struct bio" which
-                                 * represents an I/O request to a block device (like an hard disk)
-                                 * and submits this request to the controller of the device
-                                 *
-                                 * The function returns 0 when the request is successfully submitted:
-                                 * if this it not the case, we return the error code -EIO (I/O error)
-                                 * and release the allocated pages, although this should be unlikely.
-                                 * Also release the lock on the open file table of the current process
-                                 */
-
-                                ret = mapping->a_ops->readpage(opened_file, page);
-                                if (ret) {
-                                        __free_pages(first_page, order);
-                                        //spin_unlock(&files->file_lock);
-                                        printk(KERN_INFO "System call sys_session_open returned this value:%d\n", ret);
-                                        ret = -EIO;
-                                        return ret;
-                                }
-
-                                /*
-                                 * When the I/O request to the device has been successfully completed,
-                                 * the bit "PG_uptodate" in the flag of the page descriptor is set.
-                                 * Also, when the I/O request has been completed, the PG_locked bit in
-                                 * the flag of the page is cleared => in order to be sure that our I/O
-                                 * has been completed, the process goes to sleep using the value of the
-                                 * bit as condition => the process is woken up when the page gets unlocked.
-                                 * We use the function "lock_page_killable" to implement this mechanism
-                                 */
-
-                                if (!PageUptodate(page)) {
-                                        ret = lock_page_killable(page);
-
-                                        /*
-                                         * When the process is woken up we check the response of the I/O
-                                         * request: in case of error release the pages and return -EIO
-                                         * Also release the lock on the open file table of the current
-                                         * process
-                                         */
-
-                                        if (ret) {
-                                                __free_pages(first_page, order);
-                                                //spin_unlock(&files->file_lock);
-                                                printk(KERN_INFO "System call sys_session_open returned this value:%d\n",
-                                                       ret);
-                                                ret = -EIO;
-                                                return ret;
-                                        }
-
-                                        /*
-                                         * Unlock the page and wake up other processes waiting to access
-                                         * the page (if any)
-                                         */
-
-                                        unlock_page(page);
-                                }
-
-                                /*
-                                 * Go to next page
-                                 */
-
-                                page += 1;
-                        }
-
-                        /*
-                         * SET THE BUFFER FOR THIS SESSION - end
-                         */
-
-                }
-
-                /*
-                 * Install the session in the opened file
-                 */
-
-                ret=session_install(opened_file, session);
-
-                /*
-                 * Check if the session has been properly installed:
-                 * if not, return corresponding error code
+                 * Return code in case of error
                  */
 
                 if(ret)
                         return ret;
-
-                /*
-                 * The session has been successfully opened: return file descriptor
-                 * of the file that is now opened adopting the session semantics
-                 */
-
-                printk(KERN_INFO "System call sys_session_open returned this value:%d\n", fd);
         }
 
         /*
-         * Return the descriptor of the opened file or an error code
-         * in case it opening failed
+         * Return the descriptor of the opened file or an error code in case opening failed
          */
 
         return fd;
